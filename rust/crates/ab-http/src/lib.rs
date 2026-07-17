@@ -4,6 +4,7 @@
 //! CI tests use `httpmock` — never hit real networks in unit tests.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::time::Duration;
 
 /// Default TCP connect timeout.
@@ -58,7 +59,6 @@ impl HttpResponse {
 pub enum HttpError {
     Transport(String),
     BodyTooLarge { max: usize },
-    Status { status: u16, body: Vec<u8> },
 }
 
 impl std::fmt::Display for HttpError {
@@ -66,7 +66,6 @@ impl std::fmt::Display for HttpError {
         match self {
             HttpError::Transport(s) => write!(f, "http transport: {s}"),
             HttpError::BodyTooLarge { max } => write!(f, "response body exceeds {max} bytes"),
-            HttpError::Status { status, .. } => write!(f, "http status {status}"),
         }
     }
 }
@@ -142,19 +141,38 @@ impl HttpClient {
             }
         }
 
-        let bytes = resp
-            .bytes()
-            .map_err(|e| HttpError::Transport(e.to_string()))?;
-        if bytes.len() > self.max_body {
-            return Err(HttpError::BodyTooLarge { max: self.max_body });
-        }
+        // Stream into a capped buffer — do not allocate full body then check.
+        let (_st, _hdr, mut reader) = resp.split();
+        let body = read_body_capped(&mut reader, self.max_body)?;
 
         Ok(HttpResponse {
             status,
             headers: hdrs,
-            body: bytes,
+            body,
         })
     }
+}
+
+/// Read from `reader` until EOF or `max` exceeded (error without retaining oversize payload).
+fn read_body_capped(reader: &mut impl Read, max: usize) -> Result<Vec<u8>, HttpError> {
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        if body.len().saturating_add(n) > max {
+            // Drop partial buffer; do not retain oversize payload.
+            body.clear();
+            body.shrink_to_fit();
+            return Err(HttpError::BodyTooLarge { max });
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -222,5 +240,38 @@ mod tests {
         assert_eq!(resp.status, 404);
         assert_eq!(resp.body_lossy(), "nope");
         assert!(!resp.is_success());
+    }
+
+    #[test]
+    fn body_larger_than_max_errors() {
+        let server = MockServer::start();
+        let big = "x".repeat(64);
+        let _m = server.mock(|when, then| {
+            when.method(GET).path("/big");
+            then.status(200).body(big);
+        });
+        let client = HttpClient {
+            max_body: 16,
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(2),
+            ..HttpClient::default()
+        };
+        let err = client.get(&server.url("/big"), &[]).unwrap_err();
+        match err {
+            HttpError::BodyTooLarge { max } => assert_eq!(max, 16),
+            other => panic!("expected BodyTooLarge, got {other}"),
+        }
+    }
+
+    #[test]
+    fn read_body_capped_unit() {
+        let data = b"hello world this is long";
+        let mut cur = std::io::Cursor::new(&data[..]);
+        let err = read_body_capped(&mut cur, 5).unwrap_err();
+        assert!(matches!(err, HttpError::BodyTooLarge { max: 5 }));
+
+        let mut cur = std::io::Cursor::new(&data[..]);
+        let ok = read_body_capped(&mut cur, 1024).unwrap();
+        assert_eq!(ok, data);
     }
 }

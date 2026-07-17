@@ -237,8 +237,9 @@ rust/
     ab-core/                 # C ABI (cdylib+staticlib), cbindgen → agentbar.h
     ab-cli/                  # CLI binary name: agentbar (usage, cost, providers, version)
     ab-snapshot/             # Optional: last-good disk snapshot helpers (no secrets)
-  deny.toml
+  deny.toml                  # PR14 follow-up (cargo-deny CI); not required for PR1–PR3 gates
   rustfmt.toml
+  # JSON Schema fixtures: ab-model/tests/fixtures (expand in PR5); full schema files deferred
 ```
 
 **Workspace conventions** (from DontSpeak, adapted):

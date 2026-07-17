@@ -63,7 +63,8 @@ pub struct ProviderSnapshot {
     pub secondary: Option<RateWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tertiary: Option<RateWindow>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Omit when `None` or empty (design: never emit `"extraRateWindows":[]`).
+    #[serde(default, skip_serializing_if = "extra_rate_windows_omitted")]
     pub extra_rate_windows: Option<Vec<NamedRateWindow>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_remaining: Option<f64>,
@@ -189,6 +190,13 @@ fn default_true() -> bool {
     true
 }
 
+fn extra_rate_windows_omitted(v: &Option<Vec<NamedRateWindow>>) -> bool {
+    match v {
+        None => true,
+        Some(items) => items.is_empty(),
+    }
+}
+
 /// NaN/Inf → 0.0 (schema: finite f64 only).
 pub fn finite_or_zero(v: f64) -> f64 {
     if v.is_finite() { v } else { 0.0 }
@@ -311,5 +319,16 @@ mod tests {
         let v: Value = serde_json::to_value(&p).unwrap();
         assert_eq!(v["cursorRequests"]["included"], 500.0);
         assert!(v["cursorRequests"].get("remaining").is_none());
+    }
+
+    #[test]
+    fn empty_extra_rate_windows_omitted() {
+        let mut p = ProviderSnapshot::ok("codex", "2026-07-17T12:00:00Z");
+        p.extra_rate_windows = Some(vec![]);
+        let v: Value = serde_json::to_value(&p).unwrap();
+        assert!(
+            v.get("extraRateWindows").is_none(),
+            "empty extraRateWindows must be omitted: {v}"
+        );
     }
 }

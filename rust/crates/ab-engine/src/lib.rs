@@ -20,6 +20,7 @@ pub struct LastError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// ISO-8601 / RFC3339 UTC timestamp.
     pub at: String,
 }
 
@@ -51,7 +52,7 @@ impl EngineState {
     fn new() -> Self {
         Self {
             running: false,
-            snapshot: UsageSnapshot::empty(0, now_iso()),
+            snapshot: UsageSnapshot::empty(0, now_rfc3339()),
             last_error: None,
             host_signals: HostSignals::default(),
             refresh_interval_secs: 300,
@@ -92,22 +93,45 @@ fn engine() -> Arc<EngineInner> {
     e
 }
 
-fn now_iso() -> String {
-    let secs = SystemTime::now()
+/// Real UTC RFC3339 timestamp (schema v1 `updatedAt` / `LastError.at`).
+pub fn now_rfc3339() -> String {
+    let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Compact UTC-ish stamp (full chrono optional later).
-    format!("{secs}")
+        .unwrap_or_default();
+    format_rfc3339_millis(dur.as_secs(), dur.subsec_millis())
 }
 
-fn iso_rfc3339ish() -> String {
-    // Well-formed ISO-8601 without a time crate: epoch date + unix seconds as fractional.
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("1970-01-01T00:00:00.{secs:010}Z")
+/// Format unix epoch as `YYYY-MM-DDTHH:MM:SS.mmmZ` (always UTC, always `Z`).
+pub fn format_rfc3339_millis(secs: u64, millis: u32) -> String {
+    let (year, month, day, hour, min, sec) = civil_utc_from_unix(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+/// Convert unix seconds to (Y, M, D, h, m, s) UTC without external time crates.
+fn civil_utc_from_unix(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
+    let day_secs = 86_400u64;
+    let days = (secs / day_secs) as i64;
+    let rem = (secs % day_secs) as u32;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    let (y, m, d) = civil_from_days(days);
+    (y, m, d, hour, min, sec)
+}
+
+/// Howard Hinnant civil_from_days (proleptic Gregorian), days since 1970-01-01.
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
 }
 
 /// Start engine worker if not running. Returns true if running after call.
@@ -149,8 +173,10 @@ pub fn start() -> bool {
     st.worker = handle;
     st.running = true;
     ab_log::info("engine", "engine started");
+    drop(st);
     // Immediate empty snapshot so hosts have something to show.
-    publish_fake_snapshot(&mut st, &eng);
+    // Config I/O runs outside the state lock.
+    publish_fake_snapshot(&eng);
     true
 }
 
@@ -176,19 +202,18 @@ pub fn stop() -> bool {
 /// Re-read config from sticky path. Returns true if engine is running.
 pub fn reload() -> bool {
     let eng = engine();
+    // Disk I/O outside the engine state lock.
+    let load_ok = ab_config::load_raw().is_ok();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-    match ab_config::load_raw() {
-        Ok(_) => {
-            ab_log::info("config", "config reloaded from sticky path");
-            // Refresh snapshot shape from config (fake providers for now).
-            publish_fake_snapshot(&mut st, &eng);
-            st.running
-        }
-        Err(e) => {
-            set_error_locked(&mut st, "config.io", &format!("reload failed: {e}"), None);
-            false
-        }
+    if !load_ok {
+        set_error_locked(&mut st, "config.io", "reload failed", None);
+        return false;
     }
+    ab_log::info("config", "config reloaded from sticky path");
+    let running = st.running;
+    drop(st);
+    publish_fake_snapshot(&eng);
+    running
 }
 
 pub fn is_running() -> bool {
@@ -306,6 +331,8 @@ pub fn set_refresh_interval_secs(secs: u32) -> bool {
     let eng = engine();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
     st.refresh_interval_secs = secs;
+    // Wake worker so it re-reads interval promptly.
+    eng.cv.notify_all();
     true
 }
 
@@ -313,16 +340,20 @@ pub fn set_adaptive_refresh(on: bool) -> bool {
     let eng = engine();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
     st.adaptive = on;
+    eng.cv.notify_all();
     true
 }
 
 pub fn refresh_now() -> bool {
     let eng = engine();
-    let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-    if !st.running {
+    let running = {
+        let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.running
+    };
+    if !running {
         return false;
     }
-    publish_fake_snapshot(&mut st, &eng);
+    publish_fake_snapshot(&eng);
     true
 }
 
@@ -358,14 +389,14 @@ fn set_error_locked(st: &mut EngineState, code: &str, message: &str, provider_id
         code: code.into(),
         message: message.into(),
         provider_id,
-        at: now_iso(),
+        at: now_rfc3339(),
     });
 }
 
-fn publish_fake_snapshot(st: &mut EngineState, eng: &EngineInner) {
+/// Build snapshot from config **without** holding the engine state lock (disk I/O).
+fn build_fake_snapshot() -> UsageSnapshot {
     let seq = SNAPSHOT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
-    let updated = iso_rfc3339ish();
-    // Fake empty providers from config enable flags when possible.
+    let updated = now_rfc3339();
     let mut providers = Vec::new();
     if let Ok(cfg) = ab_config::load_raw()
         && let Some(arr) = cfg.get("providers").and_then(|v| v.as_array())
@@ -390,36 +421,90 @@ fn publish_fake_snapshot(st: &mut EngineState, eng: &EngineInner) {
             providers.push(row);
         }
     }
-    st.seq = seq;
-    st.snapshot = UsageSnapshot {
+    UsageSnapshot {
         schema_version: ab_model::SCHEMA_VERSION,
         seq,
         updated_at: updated,
         refreshing: false,
         providers,
-    };
+    }
+}
+
+/// Publish a fresh fake snapshot. Config load runs outside the state lock.
+fn publish_fake_snapshot(eng: &EngineInner) {
+    let snap = build_fake_snapshot();
+    let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.seq = snap.seq;
+    st.snapshot = snap;
     eng.cv.notify_all();
 }
 
 fn worker_loop(eng: Arc<EngineInner>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::SeqCst) {
-        // Sleep in short slices so stop is responsive.
-        for _ in 0..50 {
-            if stop.load(Ordering::SeqCst) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
+        let (interval_secs, adaptive) = {
+            let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+            (st.refresh_interval_secs, st.adaptive)
+        };
+
+        // Manual mode: do not advance seq without refresh_now / start.
+        // Adaptive cadence lands in PR10; until then treat adaptive like fixed 300s
+        // only when interval is also non-zero, else idle like manual.
+        if interval_secs == 0 && !adaptive {
+            sleep_interruptible(Duration::from_secs(1), &stop, &eng);
+            continue;
         }
+
+        // PR3: honor stored fixed interval (default 300). Adaptive ignored for
+        // sleep length until PR10; if adaptive with interval 0, use 300 as floor.
+        let sleep_secs = if interval_secs == 0 {
+            300u64
+        } else {
+            u64::from(interval_secs)
+        };
+        sleep_interruptible(Duration::from_secs(sleep_secs), &stop, &eng);
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.refresh_interval_secs == 0 && !st.adaptive {
-            // Manual only — skip periodic refresh.
-            continue;
+        // Re-check manual after sleep (interval may have been set to 0).
+        let still_auto = {
+            let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.refresh_interval_secs != 0 || st.adaptive
+        };
+        if still_auto {
+            publish_fake_snapshot(&eng);
         }
-        publish_fake_snapshot(&mut st, &eng);
     }
+}
+
+fn sleep_interruptible(total: Duration, stop: &AtomicBool, eng: &EngineInner) {
+    // Wake early on stop / interval change via condvar, with 200ms floor slices.
+    let deadline = SystemTime::now() + total;
+    while !stop.load(Ordering::SeqCst) {
+        let now = SystemTime::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.duration_since(now).unwrap_or(Duration::ZERO);
+        let slice = remaining.min(Duration::from_millis(200));
+        let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (_guard, _timeout) = eng
+            .cv
+            .wait_timeout(st, slice)
+            .unwrap_or_else(|e| e.into_inner());
+        // If stop was signalled, loop condition exits.
+    }
+}
+
+/// Record rejection of a non-absolute patch path (FFI contract).
+pub fn note_relative_patch_rejected(path: &str) {
+    let eng = engine();
+    let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+    set_error_locked(
+        &mut st,
+        "config.patch_invalid",
+        &format!("patch_path must be absolute, got: {path}"),
+        None,
+    );
 }
 
 /// Reset process engine state (unit/integration tests only — not for production hosts).
@@ -437,6 +522,37 @@ mod tests {
     use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn rfc3339_format_is_parseable_shape() {
+        // Fixed epoch: 0 → 1970-01-01T00:00:00.000Z
+        assert_eq!(format_rfc3339_millis(0, 0), "1970-01-01T00:00:00.000Z");
+        // 2026-07-17 roughly: use a known stamp
+        // 1_753_000_000 ≈ mid 2025; just check pattern of now_rfc3339
+        let s = now_rfc3339();
+        assert!(
+            s.ends_with('Z') && s.contains('T') && s.len() >= 24,
+            "bad iso: {s}"
+        );
+        // YYYY-MM-DDTHH:MM:SS.mmmZ
+        let parts: Vec<&str> = s.split('T').collect();
+        assert_eq!(parts.len(), 2);
+        let date = parts[0];
+        assert_eq!(date.len(), 10);
+        assert_eq!(&date[4..5], "-");
+        assert_eq!(&date[7..8], "-");
+        // Near "now": year 2020+
+        let year: i32 = date[0..4].parse().unwrap();
+        assert!(year >= 2020, "year should be current-ish: {s}");
+    }
+
+    #[test]
+    fn civil_from_days_known() {
+        // 1970-01-01
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2000-01-01 = 10957 days from 1970-01-01
+        assert_eq!(civil_from_days(10957), (2000, 1, 1));
+    }
 
     #[test]
     fn start_stop_snapshot_no_secrets() {
@@ -473,6 +589,10 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["schemaVersion"], 1);
         assert!(v["providers"].as_array().unwrap().len() >= 1);
+        // updatedAt must look like real RFC3339
+        let updated = v["updatedAt"].as_str().unwrap();
+        assert!(updated.ends_with('Z') && updated.contains('T'));
+        assert!(!updated.starts_with("1970-01-01T00:00:00."), "got {updated}");
         assert!(stop());
         assert!(!is_running());
     }
@@ -528,5 +648,47 @@ mod tests {
         // After refresh_now, seq should advance
         assert!(v2["seq"].as_u64().unwrap() > seq);
         stop();
+    }
+
+    #[test]
+    fn manual_mode_does_not_advance_seq_without_refresh() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.json");
+        std::fs::write(&cfg, r#"{"version":1,"providers":[]}"#).unwrap();
+        ab_config::set_sticky_path(cfg);
+
+        assert!(start());
+        assert!(set_refresh_interval_secs(0));
+        let seq1 = {
+            let v: Value = serde_json::from_str(&snapshot_json()).unwrap();
+            v["seq"].as_u64().unwrap()
+        };
+        // Worker would have advanced every 5s before; wait ~1.5s and ensure no advance.
+        thread::sleep(Duration::from_millis(1500));
+        let seq2 = {
+            let v: Value = serde_json::from_str(&snapshot_json()).unwrap();
+            v["seq"].as_u64().unwrap()
+        };
+        assert_eq!(seq1, seq2, "manual mode must not thrash seq");
+        assert!(refresh_now());
+        let seq3 = {
+            let v: Value = serde_json::from_str(&snapshot_json()).unwrap();
+            v["seq"].as_u64().unwrap()
+        };
+        assert!(seq3 > seq2);
+        stop();
+    }
+
+    #[test]
+    fn bad_interval_rejected() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        assert!(!set_refresh_interval_secs(7));
+        let err: Value = serde_json::from_str(&last_error_json()).unwrap();
+        assert_eq!(err["code"], "engine.bad_interval");
+        let at = err["at"].as_str().unwrap();
+        assert!(at.contains('T') && at.ends_with('Z'), "at={at}");
     }
 }

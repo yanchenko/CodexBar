@@ -103,6 +103,9 @@ pub extern "C" fn ab_config_path() -> *mut c_char {
 }
 
 /// Merge-patch sticky config from a host-written JSON file path. Returns `1`/`0` only.
+///
+/// Design contract: `patch_path` must be an **absolute** path. Relative paths are
+/// rejected (`0` + `config.patch_invalid`).
 #[unsafe(no_mangle)]
 pub extern "C" fn ab_config_apply_patch_file(patch_path: *const c_char) -> u8 {
     guard_val(0, || {
@@ -110,7 +113,12 @@ pub extern "C" fn ab_config_apply_patch_file(patch_path: *const c_char) -> u8 {
         if path.is_empty() {
             return 0;
         }
-        ab_engine::apply_patch_file(Path::new(&path)) as u8
+        let p = Path::new(&path);
+        if !p.is_absolute() {
+            ab_engine::note_relative_patch_rejected(&path);
+            return 0;
+        }
+        ab_engine::apply_patch_file(p) as u8
     })
 }
 
@@ -133,12 +141,7 @@ pub extern "C" fn ab_data_dir() -> *mut c_char {
 /// Provider catalog JSON (static metadata; no secrets). Owned `char*`.
 #[unsafe(no_mangle)]
 pub extern "C" fn ab_providers_catalog_json() -> *mut c_char {
-    guard_str("[]", || {
-        // MVP stub catalog — real registry in provider PRs.
-        to_cstring(
-            r#"[{"id":"codex","displayName":"Codex","defaultEnabled":true},{"id":"claude","displayName":"Claude","defaultEnabled":false},{"id":"cursor","displayName":"Cursor","defaultEnabled":false}]"#,
-        )
-    })
+    guard_str("[]", || to_cstring(ab_provider::mvp_catalog_json()))
 }
 
 /// Last structured error JSON or `"{}"`. Owned `char*`.
@@ -280,5 +283,87 @@ mod tests {
             );
         }
         ab_engine_stop();
+    }
+
+    #[test]
+    fn string_free_null_is_noop() {
+        ab_string_free(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn null_patch_path_and_null_signals() {
+        let _g = TEST_LOCK.lock().unwrap();
+        ab_engine::reset_for_test();
+        assert_eq!(ab_config_apply_patch_file(std::ptr::null()), 0);
+        assert_eq!(ab_set_host_signals_json(std::ptr::null()), 1);
+    }
+
+    #[test]
+    fn relative_patch_path_rejected() {
+        let _g = TEST_LOCK.lock().unwrap();
+        ab_engine::reset_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.json");
+        std::fs::write(
+            &cfg,
+            r#"{"version":1,"providers":[{"id":"codex","enabled":true,"apiKey":"keep"}]}"#,
+        )
+        .unwrap();
+        ab_config::set_sticky_path(cfg.clone());
+
+        let rel = CString::new("relative-patch.json").unwrap();
+        assert_eq!(ab_config_apply_patch_file(rel.as_ptr()), 0);
+        let err = unsafe { take_string(ab_last_error_json()) };
+        assert!(
+            err.contains("config.patch_invalid") || err.contains("absolute"),
+            "err={err}"
+        );
+        // secrets intact
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("keep"));
+    }
+
+    #[test]
+    fn invalid_interval_via_abi() {
+        let _g = TEST_LOCK.lock().unwrap();
+        ab_engine::reset_for_test();
+        assert_eq!(ab_set_refresh_interval_secs(7), 0);
+        let err = unsafe { take_string(ab_last_error_json()) };
+        assert!(err.contains("engine.bad_interval"), "err={err}");
+        assert_eq!(ab_set_refresh_interval_secs(300), 1);
+    }
+
+    #[test]
+    fn snapshot_wait_timeout_returns_current() {
+        let _g = TEST_LOCK.lock().unwrap();
+        ab_engine::reset_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.json");
+        std::fs::write(&cfg, r#"{"version":1,"providers":[]}"#).unwrap();
+        ab_config::set_sticky_path(cfg);
+        assert_eq!(ab_engine_start(), 1);
+        let snap = unsafe { take_string(ab_snapshot_json()) };
+        let v: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        let seq = v["seq"].as_u64().unwrap();
+        // Wait on current seq with short timeout — should return without hang.
+        let waited = unsafe { take_string(ab_snapshot_wait(seq, 50)) };
+        let v2: serde_json::Value = serde_json::from_str(&waited).unwrap();
+        assert_eq!(v2["seq"], seq);
+        ab_engine_stop();
+    }
+
+    #[test]
+    fn catalog_and_last_error_shapes() {
+        let _g = TEST_LOCK.lock().unwrap();
+        ab_engine::reset_for_test();
+        let cat = unsafe { take_string(ab_providers_catalog_json()) };
+        let v: serde_json::Value = serde_json::from_str(&cat).unwrap();
+        assert!(v.as_array().unwrap().len() >= 3);
+        assert_eq!(v[0]["id"], "codex");
+        assert!(v[0].get("displayName").is_some());
+
+        // empty last error
+        let err = unsafe { take_string(ab_last_error_json()) };
+        assert_eq!(err, "{}");
     }
 }

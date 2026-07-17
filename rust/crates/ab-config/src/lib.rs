@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Map, Value};
 
@@ -23,6 +24,13 @@ static STICKY: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Warning flag: both AgentBar + CodexBar files existed (one-shot).
 static BOTH_FILES_WARNED: Mutex<bool> = Mutex::new(false);
+
+/// Process-wide lock for config read-modify-write and atomic writes.
+/// All `ab_*` may be called from any host thread; concurrent patches must serialize.
+static CONFIG_IO: Mutex<()> = Mutex::new(());
+
+/// One-shot: Windows ACL harden failed / unavailable.
+static WIN_ACL_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Result of path resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +217,28 @@ pub fn default_config_value() -> Value {
     })
 }
 
+/// Validate patch root: must be a JSON object; `providers`/`hooks` must not be null.
+pub fn validate_patch(patch: &Value) -> io::Result<()> {
+    let Value::Object(map) = patch else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config patch root must be a JSON object",
+        ));
+    };
+    // Preserve denylist: null must not wipe entire providers/hooks trees.
+    for key in ["providers", "hooks"] {
+        if let Some(v) = map.get(key)
+            && v.is_null()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("config patch must not set `{key}` to null (would wipe secrets/preserve data)"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Load sticky config as raw JSON. Creates defaults if missing.
 pub fn load_raw() -> io::Result<Value> {
     let path = sticky_path()
@@ -237,19 +267,33 @@ pub fn apply_patch(patch: &Value) -> io::Result<Value> {
 }
 
 /// Apply patch at an explicit path (tests / migrate).
+///
+/// Holds [`CONFIG_IO`] across read → merge → write so concurrent host threads
+/// cannot interleave patches (and drop secret field updates).
 pub fn apply_patch_at(path: &Path, patch: &Value) -> io::Result<Value> {
+    validate_patch(patch)?;
+    let _io = CONFIG_IO.lock().unwrap_or_else(|e| e.into_inner());
     let mut base = if path.is_file() {
         let text = fs::read_to_string(path)?;
         serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     } else {
         default_config_value()
     };
-    merge_patch(&mut base, patch);
-    write_atomic(path, &base)?;
+    if !base.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sticky config root must be a JSON object",
+        ));
+    }
+    merge_patch(&mut base, patch)?;
+    write_atomic_locked(path, &base)?;
     Ok(base)
 }
 
 /// Load patch JSON from a host-written file path and apply to sticky config.
+///
+/// `patch_path` should be absolute (hosts write a temp file). Relative paths are
+/// accepted by this lower-level helper; the FFI layer enforces absolute paths.
 pub fn apply_patch_file(patch_path: &Path) -> io::Result<Value> {
     let text = fs::read_to_string(patch_path)?;
     let patch: Value =
@@ -258,34 +302,54 @@ pub fn apply_patch_file(patch_path: &Path) -> io::Result<Value> {
 }
 
 /// Deep merge `patch` into `base` (RFC 7396-ish for objects; `providers[]` merged by `id`).
-pub fn merge_patch(base: &mut Value, patch: &Value) {
+///
+/// Returns `InvalidData` if either root is not an object (callers must not replace
+/// the entire sticky document with arrays/scalars/null).
+pub fn merge_patch(base: &mut Value, patch: &Value) -> io::Result<()> {
     match (base, patch) {
         (Value::Object(base_map), Value::Object(patch_map)) => {
             for (k, pv) in patch_map {
-                if k == "providers"
-                    && let Some(patch_arr) = pv.as_array()
-                {
-                    merge_providers(base_map, patch_arr);
+                if k == "providers" {
+                    if pv.is_null() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "config patch must not set `providers` to null",
+                        ));
+                    }
+                    if let Some(patch_arr) = pv.as_array() {
+                        merge_providers(base_map, patch_arr);
+                        continue;
+                    }
+                    // Non-array providers: replace key only (not whole config).
+                    base_map.insert(k.clone(), pv.clone());
                     continue;
                 }
+                if k == "hooks" && pv.is_null() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "config patch must not set `hooks` to null",
+                    ));
+                }
                 if pv.is_null() {
-                    // JSON Merge Patch: null deletes. We still allow it for known keys.
+                    // JSON Merge Patch: null deletes (except preserve-denylist above).
                     base_map.remove(k);
                     continue;
                 }
                 match base_map.get_mut(k) {
                     Some(bv) if bv.is_object() && pv.is_object() => {
-                        merge_patch(bv, pv);
+                        merge_patch(bv, pv)?;
                     }
                     _ => {
                         base_map.insert(k.clone(), pv.clone());
                     }
                 }
             }
+            Ok(())
         }
-        (base, patch) => {
-            *base = patch.clone();
-        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config merge-patch requires object base and object patch",
+        )),
     }
 }
 
@@ -310,27 +374,50 @@ fn merge_providers(base_map: &mut Map<String, Value>, patch_arr: &[Value]) {
                 .is_some_and(|id| id == pid)
         }) {
             // Deep-merge object keys; unmentioned siblings preserved.
-            merge_patch(existing, patch_item);
+            // Provider entries are objects; ignore merge errors for malformed items.
+            let _ = merge_patch(existing, patch_item);
         } else {
             arr.push(patch_item.clone());
         }
     }
 }
 
-/// Atomic write (temp + rename) with best-effort 0600 on Unix.
+/// Atomic write (temp + bak + rename). Crash-safe: never deletes the only copy first.
+///
+/// Semantics:
+/// 1. Write `path.tmp` and `fsync`.
+/// 2. If `path` exists, rename it to `path.bak` (old content still on disk).
+/// 3. Rename `path.tmp` → `path`.
+/// 4. Best-effort delete `path.bak`.
+///
+/// Crash between (2) and (3): sticky path missing but `.bak` holds prior config.
+/// Crash before (2): original `path` intact; orphan `.tmp` may remain.
 pub fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
+    let _io = CONFIG_IO.lock().unwrap_or_else(|e| e.into_inner());
+    write_atomic_locked(path, value)
+}
+
+/// Write while caller already holds [`CONFIG_IO`].
+fn write_atomic_locked(path: &Path, value: &Value) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp_name = path
+    let file_name = path
         .file_name()
         .map(|s| s.to_os_string())
         .unwrap_or_else(|| "config.json".into());
+
+    let mut tmp_name = file_name.clone();
     tmp_name.push(".tmp");
-    let tmp_path = dir.join(tmp_name);
+    let tmp_path = dir.join(&tmp_name);
+
+    let mut bak_name = file_name.clone();
+    bak_name.push(".bak");
+    let bak_path = dir.join(&bak_name);
+
     {
         let mut f = fs::File::create(&tmp_path)?;
         f.write_all(text.as_bytes())?;
@@ -342,17 +429,156 @@ pub fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
     }
-    // Windows: rename over existing is allowed; on some FS need remove first.
+
+    // Preserve previous content via .bak instead of unlink-then-rename (Windows
+    // crash between remove and rename used to destroy the only copy).
     if path.exists() {
-        let _ = fs::remove_file(path);
+        // Replace stale bak if present so rename succeeds.
+        if bak_path.exists() {
+            let _ = fs::remove_file(&bak_path);
+        }
+        fs::rename(path, &bak_path)?;
     }
-    fs::rename(&tmp_path, path)?;
+
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        // Best-effort restore previous config if we moved it aside.
+        if bak_path.exists() && !path.exists() {
+            let _ = fs::rename(&bak_path, path);
+        }
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    let _ = fs::remove_file(&bak_path);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     }
+
+    #[cfg(windows)]
+    {
+        if let Err(e) = restrict_acl_current_user(path)
+            && !WIN_ACL_WARNED.swap(true, Ordering::SeqCst)
+        {
+            ab_log::warn(
+                "config",
+                format!(
+                    "Windows ACL harden failed (best-effort; config may inherit default DACL): {e}"
+                ),
+            );
+        }
+    }
+
+    // Silence unused on non-windows.
+    #[cfg(not(windows))]
+    {
+        let _ = &WIN_ACL_WARNED;
+    }
+
     Ok(())
+}
+
+/// Best-effort: restrict DACL so only the current user has access (design: user ACL).
+#[cfg(windows)]
+fn restrict_acl_current_user(path: &Path) -> io::Result<()> {
+    windows_acl::set_user_only_dacl(path)
+}
+
+#[cfg(windows)]
+mod windows_acl {
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, SET_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
+        TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL as WinAcl, DACL_SECURITY_INFORMATION, GetTokenInformation, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Grant FILE_ALL_ACCESS only to the process token user; protect DACL inheritance.
+    pub fn set_user_only_dacl(path: &Path) -> io::Result<()> {
+        // SAFETY: Win32 token/ACL APIs; handles closed, LocalFree on ACL, path is NUL-wide.
+        unsafe {
+            let mut token: HANDLE = ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            // Query token user size then data.
+            let mut needed: u32 = 0;
+            GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut needed);
+            if needed == 0 {
+                CloseHandle(token);
+                return Err(io::Error::last_os_error());
+            }
+            let mut buf = vec![0u8; needed as usize];
+            if GetTokenInformation(
+                token,
+                TokenUser,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                CloseHandle(token);
+                return Err(io::Error::last_os_error());
+            }
+            CloseHandle(token);
+
+            let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let sid = token_user.User.Sid;
+
+            let mut trustee: TRUSTEE_W = std::mem::zeroed();
+            trustee.TrusteeForm = TRUSTEE_IS_SID;
+            trustee.TrusteeType = TRUSTEE_IS_USER;
+            trustee.ptstrName = sid.cast();
+
+            let mut ea: EXPLICIT_ACCESS_W = std::mem::zeroed();
+            ea.grfAccessPermissions = FILE_ALL_ACCESS;
+            ea.grfAccessMode = SET_ACCESS;
+            ea.grfInheritance = NO_INHERITANCE;
+            ea.Trustee = trustee;
+
+            let mut new_dacl: *mut WinAcl = ptr::null_mut();
+            let rc = SetEntriesInAclW(1, &ea, ptr::null(), &mut new_dacl);
+            if rc != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(rc as i32));
+            }
+
+            let mut wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let rc = SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                new_dacl,
+                ptr::null_mut(),
+            );
+            if !new_dacl.is_null() {
+                LocalFree(new_dacl.cast());
+            }
+            if rc != ERROR_SUCCESS {
+                return Err(io::Error::from_raw_os_error(rc as i32));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Optional: copy sticky content to default AgentBar path and rebind sticky.
@@ -484,6 +710,65 @@ mod tests {
     }
 
     #[test]
+    fn resolve_env_codexbar_override() {
+        with_temp_home(|_home| {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = tmp.path().join("legacy.json");
+            fs::write(&p, r#"{"version":1}"#).unwrap();
+            unsafe {
+                env::set_var(ENV_CODEXBAR_CONFIG, &p);
+            }
+            let r = resolve_path().unwrap();
+            assert_eq!(r.sticky, p);
+            assert!(!r.will_create);
+        });
+    }
+
+    #[test]
+    fn resolve_xdg_agentbar() {
+        with_temp_home(|home| {
+            let xdg = home.join("xdg-config");
+            let p = xdg.join("agentbar").join("config.json");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, r#"{"version":1,"providers":[]}"#).unwrap();
+            // Also put a home agentbar that should lose to XDG when XDG file present
+            // (candidates: XDG first).
+            unsafe {
+                env::set_var("XDG_CONFIG_HOME", &xdg);
+            }
+            let r = resolve_path().unwrap();
+            assert_eq!(r.sticky, p);
+        });
+    }
+
+    #[test]
+    fn resolve_xdg_codexbar() {
+        with_temp_home(|home| {
+            let xdg = home.join("xdg-config");
+            let p = xdg.join("codexbar").join("config.json");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, r#"{"version":1}"#).unwrap();
+            unsafe {
+                env::set_var("XDG_CONFIG_HOME", &xdg);
+            }
+            let r = resolve_path().unwrap();
+            assert_eq!(r.sticky, p);
+        });
+    }
+
+    #[test]
+    fn resolve_legacy_dot_codexbar() {
+        with_temp_home(|home| {
+            let p = home.join(".codexbar").join("config.json");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, r#"{"version":1}"#).unwrap();
+            let r = resolve_path().unwrap();
+            assert_eq!(r.sticky, p);
+            assert!(!r.will_create);
+        });
+    }
+
+    #[test]
     fn merge_patch_preserves_unknowns_and_secrets_golden() {
         let mut base = json!({
             "version": 1,
@@ -507,7 +792,7 @@ mod tests {
                 { "id": "codex", "enabled": true }
             ]
         });
-        merge_patch(&mut base, &patch);
+        merge_patch(&mut base, &patch).unwrap();
 
         assert_eq!(base["customTopLevel"]["keep"], true);
         assert_eq!(base["hooks"]["onRefresh"], "echo hi");
@@ -524,6 +809,84 @@ mod tests {
 
         let cursor = providers.iter().find(|p| p["id"] == "cursor").unwrap();
         assert_eq!(cursor["cookieHeader"], "session=abc");
+    }
+
+    #[test]
+    fn non_object_patch_rejected_file_unchanged() {
+        with_temp_home(|home| {
+            let cfg = home.join(".config").join("agentbar").join("config.json");
+            fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+            let initial = json!({
+                "version": 1,
+                "providers": [
+                    { "id": "codex", "enabled": true, "apiKey": "keep-secret" }
+                ]
+            });
+            write_atomic(&cfg, &initial).unwrap();
+            set_sticky_path(cfg.clone());
+            let before = fs::read_to_string(&cfg).unwrap();
+
+            for bad in [
+                Value::Null,
+                json!([]),
+                json!("string"),
+                json!(42),
+                json!(true),
+            ] {
+                let err = apply_patch_at(&cfg, &bad).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                let after = fs::read_to_string(&cfg).unwrap();
+                assert_eq!(after, before, "file must be unchanged for patch {bad}");
+                let v: Value = serde_json::from_str(&after).unwrap();
+                assert_eq!(v["providers"][0]["apiKey"], "keep-secret");
+            }
+        });
+    }
+
+    #[test]
+    fn providers_null_patch_does_not_wipe_secrets() {
+        with_temp_home(|home| {
+            let cfg = home.join(".config").join("agentbar").join("config.json");
+            fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+            let initial = json!({
+                "version": 1,
+                "hooks": { "x": 1 },
+                "providers": [
+                    { "id": "codex", "enabled": true, "apiKey": "codex-secret" },
+                    { "id": "cursor", "enabled": false, "cookieHeader": "sess=1" }
+                ]
+            });
+            write_atomic(&cfg, &initial).unwrap();
+            set_sticky_path(cfg.clone());
+
+            let err = apply_patch_at(&cfg, &json!({"providers": null})).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+            let v: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(v["providers"][0]["apiKey"], "codex-secret");
+            assert_eq!(v["providers"][1]["cookieHeader"], "sess=1");
+            assert_eq!(v["hooks"]["x"], 1);
+
+            let err = apply_patch_at(&cfg, &json!({"hooks": null})).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let v: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(v["hooks"]["x"], 1);
+        });
+    }
+
+    #[test]
+    fn write_atomic_replaces_without_leaving_missing_target() {
+        with_temp_home(|home| {
+            let cfg = home.join("cfg.json");
+            write_atomic(&cfg, &json!({"version": 1, "n": 1})).unwrap();
+            assert!(cfg.is_file());
+            write_atomic(&cfg, &json!({"version": 1, "n": 2})).unwrap();
+            let v: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(v["n"], 2);
+            // bak cleaned up after successful replace
+            assert!(!home.join("cfg.json.bak").exists());
+            assert!(!home.join("cfg.json.tmp").exists());
+        });
     }
 
     #[test]

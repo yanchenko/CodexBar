@@ -11,6 +11,8 @@ description = "AgentBar provider registry and strategies."
 
 [dependencies]
 ab-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

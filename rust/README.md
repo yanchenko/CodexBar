@@ -25,8 +25,15 @@ cd rust
 cargo build -p ab-core
 cargo test --workspace
 cargo build --profile release-ffi -p ab-core
+# or: ./Scripts/check-release-ffi.sh
 ```
 
 FFI host builds **must** use `--profile release-ffi` (panic=unwind + symbols kept).
 
+`cargo build --release -p ab-core` is **expected to fail** (`compile_error` when `panic=abort`) — do not ship that artifact to hosts. CI should run `Scripts/check-release-ffi.sh` (optionally `EXPECT_RELEASE_ABORT=1`).
+
 Config: primary `~/.config/agentbar/config.json` with CodexBar path read-compat.
+
+## Follow-ups (not in PR1–PR3 gate)
+
+- JSON Schema fixtures under the workspace (PR5) and `deny.toml` / cargo-deny CI (PR14) are tracked design items; they are intentionally deferred here.
