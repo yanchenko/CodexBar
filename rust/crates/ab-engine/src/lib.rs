@@ -315,9 +315,7 @@ pub fn last_error_json() -> String {
 }
 
 pub fn set_refresh_interval_secs(secs: u32) -> bool {
-    // Allowed set from design; 0 = manual.
-    const ALLOWED: &[u32] = &[0, 60, 120, 300, 900, 1800];
-    if !ALLOWED.contains(&secs) {
+    if !ab_refresh::is_allowed_interval(secs) {
         let eng = engine();
         let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
         set_error_locked(
@@ -331,6 +329,7 @@ pub fn set_refresh_interval_secs(secs: u32) -> bool {
     let eng = engine();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
     st.refresh_interval_secs = secs;
+    // Turning on a fixed interval disables adaptive (hosts set adaptive separately).
     // Wake worker so it re-reads interval promptly.
     eng.cv.notify_all();
     true
@@ -424,31 +423,43 @@ fn publish_snapshot(eng: &EngineInner) {
 
 fn worker_loop(eng: Arc<EngineInner>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::SeqCst) {
-        let (interval_secs, adaptive) = {
+        let (interval_secs, adaptive, menu_at, signals) = {
             let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-            (st.refresh_interval_secs, st.adaptive)
+            (
+                st.refresh_interval_secs,
+                st.adaptive,
+                st.menu_opened_at,
+                st.host_signals.clone(),
+            )
         };
 
-        // Manual mode: do not advance seq without refresh_now / start.
-        // Adaptive cadence lands in PR10; until then treat adaptive like fixed 300s
-        // only when interval is also non-zero, else idle like manual.
-        if interval_secs == 0 && !adaptive {
+        let input = ab_refresh::AdaptiveInput {
+            now: SystemTime::now(),
+            last_menu_open_at: menu_at,
+            low_power: signals.low_power,
+            thermal_serious: signals.thermal_serious,
+        };
+
+        let Some((sleep_secs, reason)) =
+            ab_refresh::resolve_sleep_secs(interval_secs, adaptive, &input)
+        else {
+            // Manual mode: do not advance seq without refresh_now / start.
             sleep_interruptible(Duration::from_secs(1), &stop, &eng);
             continue;
+        };
+
+        if let Some(r) = reason {
+            ab_log::info(
+                "adaptive-refresh",
+                &format!("reason={} delay={}s", r.as_str(), sleep_secs),
+            );
         }
 
-        // PR3: honor stored fixed interval (default 300). Adaptive ignored for
-        // sleep length until PR10; if adaptive with interval 0, use 300 as floor.
-        let sleep_secs = if interval_secs == 0 {
-            300u64
-        } else {
-            u64::from(interval_secs)
-        };
         sleep_interruptible(Duration::from_secs(sleep_secs), &stop, &eng);
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        // Re-check manual after sleep (interval may have been set to 0).
+        // Re-check manual after sleep (interval may have been set to 0 / adaptive off).
         let still_auto = {
             let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
             st.refresh_interval_secs != 0 || st.adaptive
@@ -673,5 +684,49 @@ mod tests {
         assert_eq!(err["code"], "engine.bad_interval");
         let at = err["at"].as_str().unwrap();
         assert!(at.contains('T') && at.ends_with('Z'), "at={at}");
+    }
+
+    #[test]
+    fn host_signals_and_menu_opened_affect_adaptive_path() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        // Host signals parse.
+        assert!(set_host_signals_json(r#"{"lowPower":true,"thermalSerious":false}"#));
+        {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            assert!(st.host_signals.low_power);
+            assert!(!st.host_signals.thermal_serious);
+        }
+        // Empty clears.
+        assert!(set_host_signals_json("{}"));
+        {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            assert!(!st.host_signals.low_power);
+        }
+        // Invalid rejected.
+        assert!(!set_host_signals_json("not-json"));
+        let err: Value = serde_json::from_str(&last_error_json()).unwrap();
+        assert_eq!(err["code"], "engine.host_signals_invalid");
+
+        note_menu_opened();
+        {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            assert!(st.menu_opened_at.is_some());
+        }
+
+        // Adaptive on with constrained signals → resolve_sleep uses policy (smoke via pure fn).
+        assert!(set_adaptive_refresh(true));
+        let input = ab_refresh::AdaptiveInput {
+            now: SystemTime::now(),
+            last_menu_open_at: Some(SystemTime::now()),
+            low_power: true,
+            thermal_serious: false,
+        };
+        let (secs, reason) = ab_refresh::resolve_sleep_secs(0, true, &input).unwrap();
+        assert_eq!(secs, 30 * 60);
+        assert_eq!(reason, Some(ab_refresh::AdaptiveReason::Constrained));
     }
 }

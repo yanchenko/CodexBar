@@ -14,6 +14,7 @@ ab-model = { workspace = true }
 ab-config = { workspace = true }
 ab-log = { workspace = true }
 ab-provider = { workspace = true }
+ab-refresh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

@@ -1,0 +1,13 @@
+[package]
+name = "ab-refresh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "AgentBar fixed refresh intervals + adaptive policy (AdaptiveRefreshPolicyCore port)."
+
+[lints]
+workspace = true
