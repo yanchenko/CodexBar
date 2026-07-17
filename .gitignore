@@ -50,3 +50,8 @@ docs/.astro/
 # Swift Package Manager metadata (leave sources tracked)
 # Packages/
 # Package.resolved
+
+# AgentBar local packaging output
+apps/windows/installer/portable/
+apps/windows/installer/Output/
+
