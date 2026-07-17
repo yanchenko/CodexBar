@@ -52,4 +52,11 @@ ZIP="$OUTDIR/agentbar-$VERSION-macos-$ARCH.zip"
 )
 echo "    → $ZIP"
 ls -lh "$ZIP"
+# Optional notarize hook (no-op without Apple credentials).
+if [[ "${NOTARIZE:-0}" == "1" ]] && command -v xcrun >/dev/null 2>&1; then
+    echo "==> NOTARIZE=1 set — submit with your notarytool profile (manual step)."
+    echo "    xcrun notarytool submit \"$ZIP\" --keychain-profile <profile> --wait"
+fi
+
 echo "==> Done (unsigned/best-effort unless SIGN_IDENTITY set)."
+echo "    Artifact: $ZIP"
