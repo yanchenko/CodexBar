@@ -404,29 +404,48 @@ pub fn probe(ctx: &ProbeContext) -> ProviderSnapshot {
     s
 }
 
+/// Merge refreshed tokens into existing `claudeAiOauth` (preserve unknowns + plan fields).
+/// Atomic write under process-wide auth lock.
 fn write_back_credentials(path: &std::path::Path, creds: &ClaudeCredentials) -> Result<(), String> {
-    let mut root: Value = if path.is_file() {
-        serde_json::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
-            .unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    let obj = root.as_object_mut().ok_or("root")?;
-    let mut oauth = serde_json::Map::new();
-    oauth.insert("accessToken".into(), Value::String(creds.access_token.clone()));
-    if let Some(r) = &creds.refresh_token {
-        oauth.insert("refreshToken".into(), Value::String(r.clone()));
-    }
-    if let Some(ms) = creds.expires_at_ms {
-        oauth.insert("expiresAt".into(), serde_json::json!(ms));
-    }
-    obj.insert("claudeAiOauth".into(), Value::Object(oauth));
-    fs::write(path, serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    common::with_auth_lock(|| {
+        let mut root: Value = if path.is_file() {
+            serde_json::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+                .unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+        let obj = root.as_object_mut().ok_or_else(|| "root not object".to_string())?;
+
+        // Merge into existing oauth object — never replace wholesale.
+        let mut oauth = match obj.get("claudeAiOauth").and_then(|v| v.as_object()) {
+            Some(existing) => existing.clone(),
+            None => serde_json::Map::new(),
+        };
+        oauth.insert(
+            "accessToken".into(),
+            Value::String(creds.access_token.clone()),
+        );
+        if let Some(r) = &creds.refresh_token {
+            oauth.insert("refreshToken".into(), Value::String(r.clone()));
+        }
+        if let Some(ms) = creds.expires_at_ms {
+            oauth.insert("expiresAt".into(), serde_json::json!(ms));
+        }
+        // Re-assert known plan/tier fields when we have them (unknowns already kept).
+        if let Some(sub) = &creds.subscription_type {
+            oauth.insert("subscriptionType".into(), Value::String(sub.clone()));
+        }
+        if let Some(tier) = &creds.rate_limit_tier {
+            oauth.insert("rateLimitTier".into(), Value::String(tier.clone()));
+        }
+        obj.insert("claudeAiOauth".into(), Value::Object(oauth));
+        common::write_json_atomic_held(path, &root)
+    })
 }
 
 fn claude_cli_available() -> bool {
-    ab_proc::run("claude", &["--version"], Duration::from_secs(3), 64 * 1024)
+    let prog = common::resolve_cli_program("claude");
+    ab_proc::run(&prog, &["--version"], Duration::from_secs(3), 64 * 1024)
         .map(|o| o.success())
         .unwrap_or(false)
 }
@@ -503,8 +522,12 @@ mod tests {
     #[test]
     fn probe_auth_missing() {
         let _g = LOCK.lock().unwrap();
-        // Point HOME at empty temp so credentials file missing.
+        // Point HOME at empty temp so credentials file missing; restore after.
         let tmp = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let prev = std::env::var_os("USERPROFILE");
+        #[cfg(not(windows))]
+        let prev = std::env::var_os("HOME");
         #[cfg(windows)]
         unsafe {
             std::env::set_var("USERPROFILE", tmp.path());
@@ -526,6 +549,59 @@ mod tests {
         let snap = probe(&ctx);
         assert_eq!(snap.error_code.as_deref(), Some("auth_missing"));
         assert!(snap.error.is_some());
+        #[cfg(windows)]
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+        #[cfg(not(windows))]
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn write_back_preserves_oauth_unknowns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".credentials.json");
+        fs::write(
+            &path,
+            r#"{
+              "claudeAiOauth": {
+                "accessToken": "old",
+                "refreshToken": "rt-old",
+                "expiresAt": 1,
+                "subscriptionType": "pro",
+                "rateLimitTier": "default_claude_max_5x",
+                "scopes": ["user:inference"],
+                "organizationUuid": "org-uuid-keep"
+              },
+              "mcpOAuth": { "x": 1 }
+            }"#,
+        )
+        .unwrap();
+        let creds = ClaudeCredentials {
+            access_token: "new-at".into(),
+            refresh_token: Some("new-rt".into()),
+            expires_at_ms: Some(9_999_999_999_999.0),
+            rate_limit_tier: Some("default_claude_max_5x".into()),
+            subscription_type: Some("pro".into()),
+        };
+        write_back_credentials(&path, &creds).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let oauth = &written["claudeAiOauth"];
+        assert_eq!(oauth["accessToken"], "new-at");
+        assert_eq!(oauth["refreshToken"], "new-rt");
+        assert_eq!(oauth["subscriptionType"], "pro");
+        assert_eq!(oauth["rateLimitTier"], "default_claude_max_5x");
+        assert_eq!(oauth["scopes"][0], "user:inference");
+        assert_eq!(oauth["organizationUuid"], "org-uuid-keep");
+        assert_eq!(written["mcpOAuth"]["x"], 1);
     }
 
     #[test]

@@ -160,41 +160,52 @@ pub fn load_auth() -> Result<CodexCredentials, String> {
     parse_auth_json(&data)
 }
 
-/// Write-back refreshed tokens into existing auth.json (preserve unknown keys).
+/// Write-back refreshed tokens into existing auth.json.
+///
+/// Preserves root-level unknown keys **and** nested unknown keys under `tokens`.
+/// Uses process-wide lock + atomic temp/rename write.
 pub fn save_auth(creds: &CodexCredentials, path: &Path) -> Result<(), String> {
-    let mut root: Value = if path.is_file() {
-        let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| "auth.json root not object".to_string())?;
-    let mut tokens = serde_json::Map::new();
-    tokens.insert("access_token".into(), Value::String(creds.access_token.clone()));
-    tokens.insert("refresh_token".into(), Value::String(creds.refresh_token.clone()));
-    if let Some(id) = &creds.id_token {
-        tokens.insert("id_token".into(), Value::String(id.clone()));
-    }
-    if let Some(aid) = &creds.account_id {
-        tokens.insert("account_id".into(), Value::String(aid.clone()));
-    }
-    obj.insert("tokens".into(), Value::Object(tokens));
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    obj.insert(
-        "last_refresh".into(),
-        Value::String(common::rfc3339_from_unix(now as i64)),
-    );
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    fs::write(path, text).map_err(|e| e.to_string())?;
-    Ok(())
+    common::with_auth_lock(|| {
+        let mut root: Value = if path.is_file() {
+            let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+            serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+        let obj = root
+            .as_object_mut()
+            .ok_or_else(|| "auth.json root not object".to_string())?;
+
+        // Merge into existing `tokens` object so nested unknowns survive.
+        let mut tokens = match obj.get("tokens").and_then(|v| v.as_object()) {
+            Some(existing) => existing.clone(),
+            None => serde_json::Map::new(),
+        };
+        tokens.insert(
+            "access_token".into(),
+            Value::String(creds.access_token.clone()),
+        );
+        tokens.insert(
+            "refresh_token".into(),
+            Value::String(creds.refresh_token.clone()),
+        );
+        if let Some(id) = &creds.id_token {
+            tokens.insert("id_token".into(), Value::String(id.clone()));
+        }
+        if let Some(aid) = &creds.account_id {
+            tokens.insert("account_id".into(), Value::String(aid.clone()));
+        }
+        obj.insert("tokens".into(), Value::Object(tokens));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        obj.insert(
+            "last_refresh".into(),
+            Value::String(common::rfc3339_from_unix(now as i64)),
+        );
+        common::write_json_atomic_held(path, &root)
+    })
 }
 
 /// Refresh access token via OpenAI OAuth.
@@ -506,9 +517,10 @@ fn try_app_server_rpc(ctx: &ProbeContext) -> Option<ProviderSnapshot> {
         };
     }
 
-    // Spawn is optional/best-effort — short timeout; skip if not on PATH.
+    // Prefer absolute CLI path (known installs / PATH resolve) over bare name.
+    let prog = common::resolve_cli_program("codex");
     let out = ab_proc::run(
-        "codex",
+        &prog,
         &["--version"],
         Duration::from_secs(3),
         64 * 1024,
@@ -742,5 +754,42 @@ mod tests {
         let snap = map_rpc_rate_limits(fixture, "t").unwrap();
         assert!(snap.primary.is_some());
         assert_eq!(snap.source_label.as_deref(), Some("cli"));
+    }
+
+    #[test]
+    fn save_auth_preserves_tokens_unknowns_and_root_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{
+              "tokens": {
+                "access_token": "old-at",
+                "refresh_token": "old-rt",
+                "account_id": "acc",
+                "id_token": "id",
+                "extra_nested": "keep-me",
+                "scope": "openid"
+              },
+              "OPENAI_API_KEY": null,
+              "custom_root": "root-keep"
+            }"#,
+        )
+        .unwrap();
+        let creds = CodexCredentials {
+            access_token: "new-at".into(),
+            refresh_token: "new-rt".into(),
+            id_token: Some("id2".into()),
+            account_id: Some("acc".into()),
+            last_refresh: Some(SystemTime::now()),
+        };
+        save_auth(&creds, &path).unwrap();
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["tokens"]["access_token"], "new-at");
+        assert_eq!(written["tokens"]["refresh_token"], "new-rt");
+        assert_eq!(written["tokens"]["extra_nested"], "keep-me");
+        assert_eq!(written["tokens"]["scope"], "openid");
+        assert_eq!(written["custom_root"], "root-keep");
+        assert!(written.get("last_refresh").is_some());
     }
 }
