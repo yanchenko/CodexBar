@@ -1,0 +1,16 @@
+[package]
+name = "ab-log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "AgentBar redacting structured logger."
+
+[dependencies]
+log = { workspace = true }
+
+[lints]
+workspace = true

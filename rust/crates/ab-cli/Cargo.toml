@@ -1,0 +1,21 @@
+[package]
+name = "ab-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "AgentBar CLI (agentbar)."
+
+[[bin]]
+name = "agentbar"
+path = "src/main.rs"
+
+[dependencies]
+ab-model = { workspace = true }
+ab-engine = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "ab-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "AgentBar provider registry and strategies."
+
+[dependencies]
+ab-model = { workspace = true }
+
+[lints]
+workspace = true

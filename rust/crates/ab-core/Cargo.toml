@@ -1,0 +1,20 @@
+[package]
+name = "ab-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "AgentBar C ABI (agentbar.h / ab_*) — cdylib + staticlib for native hosts."
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+ab-engine = { workspace = true }
+ab-model = { workspace = true }
+
+[lints]
+workspace = true

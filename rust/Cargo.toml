@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ab-model",
+    "crates/ab-config",
+    "crates/ab-log",
+    "crates/ab-proc",
+    "crates/ab-http",
+    "crates/ab-provider",
+    "crates/ab-engine",
+    "crates/ab-core",
+    "crates/ab-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/yanchenko/AgentBar"
+authors = ["AgentBar contributors"]
+publish = false
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27"
+log = "0.4"
+directories = "6.0"
+# Blocking HTTPS (rustls + ring; no native-tls/openssl, no tokio).
+attohttpc = { version = "0.31", default-features = false, features = ["tls-rustls-webpki-roots-ring"] }
+httpmock = "0.8.3"
+
+# Internal crates
+ab-model = { path = "crates/ab-model" }
+ab-config = { path = "crates/ab-config" }
+ab-log = { path = "crates/ab-log" }
+ab-proc = { path = "crates/ab-proc" }
+ab-http = { path = "crates/ab-http" }
+ab-provider = { path = "crates/ab-provider" }
+ab-engine = { path = "crates/ab-engine" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+# FFI staticlib/cdylib profile: panic=unwind so catch_unwind works; no strip so
+# Swift/linker can resolve #[no_mangle] symbols (DontSpeak ds-core pattern).
+[profile.release-ffi]
+inherits = "release"
+strip = false
+lto = false
+panic = "unwind"
