@@ -1,21 +1,26 @@
-//! Provider registry and strategies (Codex / Claude / Cursor MVP).
+//! Provider registry and strategies (Codex / Claude / Cursor MVP + OpenRouter API-key wave).
 //!
 //! Engine calls [`probe_enabled_providers`] on refresh. Strategies never put
 //! secrets (`apiKey`, `cookieHeader`, tokens) into [`ab_model::ProviderSnapshot`].
+//!
+//! **Expansion:** see [`registry`] — new API-key providers need no host changes.
 
 mod claude;
 mod codex;
 mod common;
 mod cursor;
+mod openrouter;
+pub mod registry;
 
 use ab_http::HttpClient;
 use ab_model::ProviderSnapshot;
-use serde::Serialize;
 use serde_json::Value;
 
 pub use claude::{map_usage_response as map_claude_usage, parse_credentials_json};
 pub use codex::{map_usage_response as map_codex_usage, parse_auth_json};
 pub use cursor::{manual_cookie, map_usage_summary as map_cursor_usage};
+pub use openrouter::map_credits_response as map_openrouter_credits;
+pub use registry::{builtin_catalog, catalog_json, CatalogEntry};
 
 /// Stable provider id wire string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,14 +28,24 @@ pub enum ProviderId {
     Codex,
     Claude,
     Cursor,
+    OpenRouter,
 }
 
 impl ProviderId {
+    /// All known ids (for registry coverage checks).
+    pub const ALL: &'static [ProviderId] = &[
+        ProviderId::Codex,
+        ProviderId::Claude,
+        ProviderId::Cursor,
+        ProviderId::OpenRouter,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ProviderId::Codex => "codex",
             ProviderId::Claude => "claude",
             ProviderId::Cursor => "cursor",
+            ProviderId::OpenRouter => "openrouter",
         }
     }
 
@@ -39,44 +54,20 @@ impl ProviderId {
             "codex" => Some(ProviderId::Codex),
             "claude" => Some(ProviderId::Claude),
             "cursor" => Some(ProviderId::Cursor),
+            "openrouter" => Some(ProviderId::OpenRouter),
             _ => None,
         }
     }
 }
 
-/// Static MVP catalog entry.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CatalogEntry {
-    pub id: &'static str,
-    pub display_name: &'static str,
-    pub default_enabled: bool,
-}
-
 /// MVP catalog (no secrets). Single source of truth for FFI `ab_providers_catalog_json`.
 pub fn mvp_catalog() -> &'static [CatalogEntry] {
-    &[
-        CatalogEntry {
-            id: "codex",
-            display_name: "Codex",
-            default_enabled: true,
-        },
-        CatalogEntry {
-            id: "claude",
-            display_name: "Claude",
-            default_enabled: false,
-        },
-        CatalogEntry {
-            id: "cursor",
-            display_name: "Cursor",
-            default_enabled: false,
-        },
-    ]
+    registry::builtin_catalog()
 }
 
 /// Catalog JSON for hosts (no secrets). Shared by FFI.
 pub fn mvp_catalog_json() -> String {
-    serde_json::to_string(mvp_catalog()).unwrap_or_else(|_| "[]".into())
+    registry::catalog_json()
 }
 
 /// Endpoint / fixture overrides (production: all `None`; tests inject httpmock bases).
@@ -91,6 +82,8 @@ pub struct EndpointOverrides {
     pub claude_usage_fixture_json: Option<String>,
     pub cursor_base: Option<String>,
     pub cursor_usage_fixture_json: Option<String>,
+    pub openrouter_base: Option<String>,
+    pub openrouter_credits_fixture_json: Option<String>,
 }
 
 /// Context passed to each provider probe.
@@ -115,17 +108,18 @@ impl ProbeContext {
 
 /// Probe a single enabled provider by id.
 pub fn probe_provider(id: ProviderId, ctx: &ProbeContext) -> ProviderSnapshot {
-    match id {
-        ProviderId::Codex => codex::probe(ctx),
-        ProviderId::Claude => claude::probe(ctx),
-        ProviderId::Cursor => cursor::probe(ctx),
-    }
+    registry::dispatch_probe(id, ctx)
 }
 
-/// Walk config `providers[]` and probe each **enabled** MVP provider.
+/// Walk config `providers[]` and probe each **enabled** registered provider.
 /// Unknown provider ids are skipped (not crashed). Secrets never copied into rows.
 pub fn probe_enabled_providers(config: &Value, updated_at: &str) -> Vec<ProviderSnapshot> {
-    probe_enabled_providers_with(config, updated_at, HttpClient::default(), EndpointOverrides::default())
+    probe_enabled_providers_with(
+        config,
+        updated_at,
+        HttpClient::default(),
+        EndpointOverrides::default(),
+    )
 }
 
 /// Same as [`probe_enabled_providers`] with injectable HTTP + endpoints (tests).
@@ -146,7 +140,7 @@ pub fn probe_enabled_providers_with(
             continue;
         }
         let Some(pid) = ProviderId::parse(id_str) else {
-            // Non-MVP / unknown: skip (preserve secrets on disk; do not surface).
+            // Non-registered / unknown: skip (preserve secrets on disk; do not surface).
             continue;
         };
         let ctx = ProbeContext {
@@ -173,6 +167,7 @@ fn looks_like_secret(s: &str) -> bool {
         || s.contains("Bearer ")
         || s.contains("cookieHeader")
         || s.contains("access_token")
+        || s.contains("refresh_token")
         || s.contains("WorkosCursorSessionToken=")
 }
 
@@ -186,6 +181,7 @@ mod tests {
         assert!(s.contains("codex"));
         assert!(s.contains("claude"));
         assert!(s.contains("cursor"));
+        assert!(s.contains("openrouter"));
         assert!(s.contains("displayName"));
         assert!(!s.contains("apiKey"));
         // defaultEnabled: codex true, others false
@@ -195,6 +191,8 @@ mod tests {
         assert_eq!(arr[0]["defaultEnabled"], true);
         assert_eq!(arr[1]["defaultEnabled"], false);
         assert_eq!(arr[2]["defaultEnabled"], false);
+        assert_eq!(arr[3]["id"], "openrouter");
+        assert_eq!(arr[3]["defaultEnabled"], false);
     }
 
     #[test]
@@ -243,5 +241,34 @@ mod tests {
         let json = serde_json::to_string(&rows).unwrap();
         assert!(!json.contains("SUPER_SECRET_COOKIE_VALUE"));
         assert!(!json.contains("cookieHeader"));
+    }
+
+    #[test]
+    fn openrouter_enabled_probes_without_host_changes() {
+        let cfg = serde_json::json!({
+            "providers": [{
+                "id": "openrouter",
+                "enabled": true,
+                "apiKey": "sk-or-v1-SECRET_NEVER_IN_SNAP"
+            }]
+        });
+        let rows = probe_enabled_providers_with(
+            &cfg,
+            "t",
+            HttpClient {
+                connect_timeout: std::time::Duration::from_millis(50),
+                read_timeout: std::time::Duration::from_millis(50),
+                ..HttpClient::default()
+            },
+            EndpointOverrides {
+                openrouter_base: Some("http://127.0.0.1:1".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "openrouter");
+        let json = serde_json::to_string(&rows[0]).unwrap();
+        assert!(!json.contains("sk-or-v1-SECRET_NEVER_IN_SNAP"));
+        assert!(!json.contains("apiKey"));
     }
 }
