@@ -1,0 +1,48 @@
+# AgentBar Linux GUI host — GTK4 + StatusNotifierItem (ksni).
+# Standalone crate (not in rust/ workspace): Linux-only GTK deps must not affect
+# Windows/macOS `cargo test --workspace`.
+#
+# On Linux:  cargo build --release
+# On Windows/CI smoke: cargo check --no-default-features  (stub binary)
+[package]
+name = "ab-linux-gtk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+publish = false
+description = "AgentBar Linux GUI host (GTK4 + ksni tray); hosts ab-core in-process."
+
+[workspace]
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[[bin]]
+name = "agentbar-gtk"
+path = "src/main.rs"
+
+[features]
+default = ["gui"]
+gui = ["dep:gtk", "dep:ksni", "dep:async-channel"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ab-core = { path = "../../../rust/crates/ab-core" }
+ab-model = { path = "../../../rust/crates/ab-model" }
+
+# Optional so `cargo check --no-default-features` works without system GTK.
+gtk = { package = "gtk4", version = "0.9", optional = true }
+# blocking = dedicated DBus thread (DontSpeak tray.rs pattern).
+ksni = { version = "0.3", optional = true, features = ["blocking"] }
+async-channel = { version = "2", optional = true }
+
+# ab-core FFI requires panic=unwind (catch_unwind). Override workspace release abort.
+[profile.release]
+panic = "unwind"
+lto = false
+codegen-units = 16
+
+[profile.dev]
+panic = "unwind"
