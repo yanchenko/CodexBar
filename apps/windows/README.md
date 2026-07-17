@@ -74,9 +74,19 @@ Single-instance: a second launch activates the running instance (named mutex `Ag
 ### What the tray shows
 
 - **Text-only** `MenuFlyout` provider rows from `ab_snapshot_json` (no ProgressBars in the flyout).
-- **Settings…** — placeholder window (version, config path, snapshot lines).
+- **Settings…** — Fluent NavigationView: Dashboard ProgressBars, Providers (toggle/secret paste via temp JSON patch + `ab_config_apply_patch_file`), General (refresh cadence), Advanced (paths).
 - **Refresh** — `ab_refresh_now`.
 - **Exit** — `ab_engine_stop` + quit.
+
+## Portable zip
+
+```powershell
+pwsh apps/windows/installer/build-portable.ps1          # x64 self-contained zip
+pwsh apps/windows/installer/build-portable.ps1 -Arch arm64
+pwsh apps/windows/installer/build-portable.ps1 -SkipPublish  # re-zip existing stage
+```
+
+Output: `apps/windows/installer/Output/agentbar-<ver>-windows-x86_64.zip`
 
 Enabled MVP providers (Codex / Claude / Cursor) are probed by the engine: real usage when credentials exist, otherwise a structured `auth_missing` (or related) error — never a crash.
 

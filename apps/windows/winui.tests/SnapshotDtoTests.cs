@@ -139,6 +139,37 @@ public class SnapshotDtoTests
     }
 
     [Fact]
+    public void HostPatchJsonIsProvidersArrayMergeShape()
+    {
+        // Settings must only emit merge-patch objects with providers[] by id —
+        // never a full typed config rewrite root. Shape mirrors Native.PatchProvider.
+        using var stream = new System.IO.MemoryStream();
+        using (var w = new Utf8JsonWriter(stream))
+        {
+            w.WriteStartObject();
+            w.WritePropertyName("providers");
+            w.WriteStartArray();
+            w.WriteStartObject();
+            w.WriteString("id", "codex");
+            w.WriteBoolean("enabled", true);
+            w.WriteString("apiKey", "secret-not-over-ffi");
+            w.WriteEndObject();
+            w.WriteEndArray();
+            w.WriteEndObject();
+        }
+        var json = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(JsonValueKind.Object, doc.RootElement.ValueKind);
+        Assert.True(doc.RootElement.TryGetProperty("providers", out var providers));
+        Assert.Equal(JsonValueKind.Array, providers.ValueKind);
+        Assert.Equal("codex", providers[0].GetProperty("id").GetString());
+        // Patch may contain secrets on disk; snapshot fixtures must never.
+        Assert.True(json.Contains("apiKey", StringComparison.Ordinal));
+        // Forbidden shapes for host save path.
+        Assert.False(doc.RootElement.TryGetProperty("version", out _), "host patch must not rewrite whole tree version");
+    }
+
+    [Fact]
     public void CursorRequestsThinDto()
     {
         var snap = Parse(Load("cursor_requests.json"));

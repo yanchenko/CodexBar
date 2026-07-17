@@ -16,7 +16,7 @@
     <!-- Default RID x64; ARM64 builds should pass -r win-arm64 (or -p:Platform=ARM64). -->
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and '$(Platform)' == 'ARM64'">win-arm64</RuntimeIdentifier>
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
-    <!-- Map RID or Platform so CargoFfiOutDir matches the cargo --target used for ab_core. -->
+    <!-- Map RID or Platform so CargoFfiOutDir matches the cargo target used for ab_core. -->
     <CargoArchSub Condition="'$(RuntimeIdentifier)' == 'win-arm64' or '$(Platform)' == 'ARM64'">aarch64-pc-windows-msvc\</CargoArchSub>
     <!-- ab_core.dll is built under release-ffi (panic=unwind for catch_unwind). -->
     <CargoFfiOutDir>$(MSBuildThisFileDirectory)..\..\..\rust\target\$(CargoArchSub)release-ffi\</CargoFfiOutDir>
