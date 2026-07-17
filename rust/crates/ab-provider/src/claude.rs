@@ -1,5 +1,7 @@
 //! Claude provider: file credentials / API key / CLI (no Keychain on Windows/Linux).
 //!
+//! PR7: defaultEnabled false; structured auth_missing without crash.
+//!
 //! Order (Win/Linux): `~/.claude/.credentials.json` → config `apiKey` → `claude` CLI presence.
 //! `defaultEnabled` is false (catalog). Never puts tokens into snapshots.
 
