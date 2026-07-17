@@ -20,8 +20,9 @@ final class Core {
         pollTask = Task { [weak self] in
             var lastSeq: UInt64 = 0
             while !Task.isCancelled {
-                let json = await Task.detached(priority: .utility) {
-                    Native.snapshotWait(sinceSeq: lastSeq, timeoutMs: 2_000)
+                let sinceSeq = lastSeq
+                let json = await Task.detached(priority: .utility) { @Sendable in
+                    Native.snapshotWait(sinceSeq: sinceSeq, timeoutMs: 2_000)
                 }.value
                 guard !Task.isCancelled else { break }
                 await MainActor.run {

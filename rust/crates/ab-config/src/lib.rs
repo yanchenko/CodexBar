@@ -10,7 +10,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(windows)]
+use std::sync::atomic::Ordering;
 
 use serde_json::{Map, Value};
 

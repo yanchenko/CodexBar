@@ -52,6 +52,6 @@ docs/.astro/
 # Package.resolved
 
 # AgentBar local packaging output
+dist/
 apps/windows/installer/portable/
 apps/windows/installer/Output/
-

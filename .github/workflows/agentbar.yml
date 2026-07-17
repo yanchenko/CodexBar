@@ -98,7 +98,7 @@ jobs:
           test -f apps/macos/Package.swift
           test -f apps/macos/Sources/CAgentBar/include/agentbar.h
           test -f apps/macos/Sources/AgentBar/AgentBarApp.swift
-          test -f apps/macos/build.sh
-          test -f apps/macos/package.sh
+          test -x apps/macos/build.sh
+          test -x apps/macos/package.sh
           test -f docs/security-surface.md
           echo "macOS host sources + security doc OK"
