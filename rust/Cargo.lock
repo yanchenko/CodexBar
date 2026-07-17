@@ -78,9 +78,15 @@ version = "0.1.0"
 name = "ab-provider"
 version = "0.1.0"
 dependencies = [
+ "ab-config",
+ "ab-http",
+ "ab-log",
  "ab-model",
+ "ab-proc",
+ "httpmock",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

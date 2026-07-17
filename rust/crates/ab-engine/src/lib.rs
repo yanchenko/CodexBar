@@ -1,7 +1,7 @@
 //! Engine runtime: lifecycle, refresh, snapshot store.
 //!
-//! Process-global state (handle-free C ABI). Worker thread builds fake/empty
-//! provider snapshots until real providers land.
+//! Process-global state (handle-free C ABI). Worker thread probes MVP providers
+//! (Codex / Claude / Cursor) and publishes snapshot JSON (no secrets).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ab_model::{ProviderSnapshot, UsageSnapshot};
+use ab_model::UsageSnapshot;
 use serde::{Deserialize, Serialize};
 
 /// Structured last-error DTO (`ab_last_error_json`).
@@ -174,9 +174,9 @@ pub fn start() -> bool {
     st.running = true;
     ab_log::info("engine", "engine started");
     drop(st);
-    // Immediate empty snapshot so hosts have something to show.
-    // Config I/O runs outside the state lock.
-    publish_fake_snapshot(&eng);
+    // Immediate probe so hosts have real rows (or structured auth_missing).
+    // Config I/O + network run outside the state lock.
+    publish_snapshot(&eng);
     true
 }
 
@@ -212,7 +212,7 @@ pub fn reload() -> bool {
     ab_log::info("config", "config reloaded from sticky path");
     let running = st.running;
     drop(st);
-    publish_fake_snapshot(&eng);
+    publish_snapshot(&eng);
     running
 }
 
@@ -353,7 +353,7 @@ pub fn refresh_now() -> bool {
     if !running {
         return false;
     }
-    publish_fake_snapshot(&eng);
+    publish_snapshot(&eng);
     true
 }
 
@@ -393,34 +393,17 @@ fn set_error_locked(st: &mut EngineState, code: &str, message: &str, provider_id
     });
 }
 
-/// Build snapshot from config **without** holding the engine state lock (disk I/O).
-fn build_fake_snapshot() -> UsageSnapshot {
+/// Build snapshot from config + provider probes **without** holding the engine state lock.
+fn build_snapshot() -> UsageSnapshot {
     let seq = SNAPSHOT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     let updated = now_rfc3339();
-    let mut providers = Vec::new();
-    if let Ok(cfg) = ab_config::load_raw()
-        && let Some(arr) = cfg.get("providers").and_then(|v| v.as_array())
-    {
-        for p in arr {
-            let id = p
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let enabled = p.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-            if !enabled {
-                continue;
-            }
-            // Never put secrets into snapshot — only id/enabled.
-            let mut row = ProviderSnapshot::ok(&id, &updated);
-            row.enabled = enabled;
-            row.source_label = Some("none".into());
-            // Placeholder: no real probe yet.
-            row.error = Some("provider probe not implemented".into());
-            row.error_code = Some("not_implemented".into());
-            providers.push(row);
+    let providers = match ab_config::load_raw() {
+        Ok(cfg) => ab_provider::probe_enabled_providers(&cfg, &updated),
+        Err(e) => {
+            ab_log::warn("engine", &format!("config load for snapshot: {e}"));
+            Vec::new()
         }
-    }
+    };
     UsageSnapshot {
         schema_version: ab_model::SCHEMA_VERSION,
         seq,
@@ -430,9 +413,9 @@ fn build_fake_snapshot() -> UsageSnapshot {
     }
 }
 
-/// Publish a fresh fake snapshot. Config load runs outside the state lock.
-fn publish_fake_snapshot(eng: &EngineInner) {
-    let snap = build_fake_snapshot();
+/// Publish a fresh probed snapshot. Config load + probes run outside the state lock.
+fn publish_snapshot(eng: &EngineInner) {
+    let snap = build_snapshot();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
     st.seq = snap.seq;
     st.snapshot = snap;
@@ -471,7 +454,7 @@ fn worker_loop(eng: Arc<EngineInner>, stop: Arc<AtomicBool>) {
             st.refresh_interval_secs != 0 || st.adaptive
         };
         if still_auto {
-            publish_fake_snapshot(&eng);
+            publish_snapshot(&eng);
         }
     }
 }

@@ -1,0 +1,20 @@
+{
+  "plan_type": "pro",
+  "rate_limit": {
+    "primary_window": {
+      "used_percent": 15,
+      "reset_at": 2000000000,
+      "limit_window_seconds": 18000
+    },
+    "secondary_window": {
+      "used_percent": 5,
+      "reset_at": 2000500000,
+      "limit_window_seconds": 604800
+    }
+  },
+  "credits": {
+    "has_credits": true,
+    "unlimited": false,
+    "balance": 150.0
+  }
+}

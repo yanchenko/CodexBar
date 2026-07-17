@@ -11,8 +11,16 @@ description = "AgentBar provider registry and strategies."
 
 [dependencies]
 ab-model = { workspace = true }
+ab-http = { workspace = true }
+ab-proc = { workspace = true }
+ab-config = { workspace = true }
+ab-log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+httpmock = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
