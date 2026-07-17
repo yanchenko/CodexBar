@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "seq": 9,
+  "updatedAt": "2026-07-17T12:00:00Z",
+  "refreshing": false,
+  "providers": [
+    {
+      "id": "cursor",
+      "enabled": true,
+      "sourceLabel": "web",
+      "updatedAt": "2026-07-17T12:00:00Z",
+      "primary": {
+        "usedPercent": 8.4,
+        "windowMinutes": 10080
+      },
+      "cursorRequests": {
+        "included": 500.0,
+        "used": 42.0,
+        "remaining": 458.0
+      },
+      "dataConfidence": "exact"
+    }
+  ]
+}

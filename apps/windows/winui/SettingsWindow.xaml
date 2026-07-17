@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="AgentBar.SettingsWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="AgentBar">
+
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+
+    <NavigationView x:Name="Nav"
+                    IsBackButtonVisible="Collapsed"
+                    IsSettingsVisible="False"
+                    PaneDisplayMode="Left"
+                    OpenPaneLength="180"
+                    SelectionChanged="Nav_SelectionChanged">
+        <NavigationView.MenuItems>
+            <NavigationViewItem Content="Dashboard" Tag="dashboard" IsSelected="True">
+                <NavigationViewItem.Icon>
+                    <FontIcon Glyph="&#xE80F;" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem Content="Providers" Tag="providers">
+                <NavigationViewItem.Icon>
+                    <FontIcon Glyph="&#xE716;" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem Content="General" Tag="general">
+                <NavigationViewItem.Icon>
+                    <FontIcon Glyph="&#xE713;" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+            <NavigationViewItem Content="Advanced" Tag="advanced">
+                <NavigationViewItem.Icon>
+                    <FontIcon Glyph="&#xE90F;" />
+                </NavigationViewItem.Icon>
+            </NavigationViewItem>
+        </NavigationView.MenuItems>
+
+        <Grid Padding="20">
+            <!-- Dashboard: ProgressBars live here only (not tray) -->
+            <ScrollViewer x:Name="DashboardPage" Visibility="Visible">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Dashboard" Style="{StaticResource TitleTextBlockStyle}" />
+                    <TextBlock x:Name="DashMeta" Opacity="0.75" TextWrapping="Wrap" />
+                    <StackPanel x:Name="DashProviders" Spacing="12" />
+                    <Button Content="Refresh now" Click="Refresh_Click" HorizontalAlignment="Left" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- Providers: toggles + secret paste via temp patch file -->
+            <ScrollViewer x:Name="ProvidersPage" Visibility="Collapsed">
+                <StackPanel Spacing="16">
+                    <TextBlock Text="Providers" Style="{StaticResource TitleTextBlockStyle}" />
+                    <TextBlock Text="Toggles and secrets are applied via merge-patch (never full config rewrite)."
+                               Opacity="0.75" TextWrapping="Wrap" />
+
+                    <Border Padding="16" CornerRadius="8"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="Codex" Style="{StaticResource SubtitleTextBlockStyle}" />
+                            <ToggleSwitch x:Name="CodexEnabled" Header="Enabled" Toggled="ProviderToggle_Toggled" Tag="codex" />
+                            <PasswordBox x:Name="CodexApiKey" Header="API key (optional)"
+                                         PlaceholderText="Paste key — stored only in sticky config.json" />
+                            <Button Content="Save Codex credentials" Click="SaveCodex_Click" Tag="codex" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Padding="16" CornerRadius="8"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="Claude" Style="{StaticResource SubtitleTextBlockStyle}" />
+                            <ToggleSwitch x:Name="ClaudeEnabled" Header="Enabled" Toggled="ProviderToggle_Toggled" Tag="claude" />
+                            <PasswordBox x:Name="ClaudeApiKey" Header="API key (optional)"
+                                         PlaceholderText="Paste key — or use ~/.claude credentials" />
+                            <Button Content="Save Claude credentials" Click="SaveClaude_Click" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Padding="16" CornerRadius="8"
+                            Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                            BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="1">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="Cursor" Style="{StaticResource SubtitleTextBlockStyle}" />
+                            <ToggleSwitch x:Name="CursorEnabled" Header="Enabled" Toggled="ProviderToggle_Toggled" Tag="cursor" />
+                            <PasswordBox x:Name="CursorCookie" Header="Cookie header (manual)"
+                                         PlaceholderText="Paste WorkosCursorSessionToken=…" />
+                            <Button Content="Save Cursor cookie" Click="SaveCursor_Click" />
+                        </StackPanel>
+                    </Border>
+
+                    <TextBlock x:Name="ProvidersStatus" Opacity="0.75" TextWrapping="Wrap" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- General: refresh cadence -->
+            <ScrollViewer x:Name="GeneralPage" Visibility="Collapsed">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="General" Style="{StaticResource TitleTextBlockStyle}" />
+                    <ComboBox x:Name="RefreshCombo" Header="Refresh interval"
+                              SelectionChanged="RefreshCombo_SelectionChanged" Width="280">
+                        <ComboBoxItem Content="Manual" Tag="0" />
+                        <ComboBoxItem Content="1 minute" Tag="60" />
+                        <ComboBoxItem Content="2 minutes" Tag="120" />
+                        <ComboBoxItem Content="5 minutes (default)" Tag="300" IsSelected="True" />
+                        <ComboBoxItem Content="15 minutes" Tag="900" />
+                        <ComboBoxItem Content="30 minutes" Tag="1800" />
+                        <ComboBoxItem Content="Adaptive" Tag="adaptive" />
+                    </ComboBox>
+                    <TextBlock Text="Adaptive uses menu-open + power/thermal host signals (2–30 min)."
+                               Opacity="0.75" TextWrapping="Wrap" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- Advanced: paths + migrate -->
+            <ScrollViewer x:Name="AdvancedPage" Visibility="Collapsed">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="Advanced" Style="{StaticResource TitleTextBlockStyle}" />
+                    <TextBlock x:Name="VersionText" Text="Version: —" TextWrapping="Wrap" />
+                    <TextBlock x:Name="ConfigPathText" Text="Config: —" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                    <TextBlock x:Name="LogDirText" Text="Logs: —" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+                    <TextBlock x:Name="EngineText" Text="Engine: —" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="Reveal config path" Click="RevealConfig_Click" />
+                        <Button Content="Open log folder" Click="OpenLogs_Click" />
+                        <Button Content="Migrate to AgentBar path" Click="Migrate_Click" />
+                    </StackPanel>
+                    <TextBlock x:Name="AdvancedStatus" Opacity="0.75" TextWrapping="Wrap" />
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+    </NavigationView>
+</Window>

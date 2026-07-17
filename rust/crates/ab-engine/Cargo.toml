@@ -1,0 +1,25 @@
+[package]
+name = "ab-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+description = "AgentBar engine runtime: lifecycle, refresh, snapshot store."
+
+[dependencies]
+ab-model = { workspace = true }
+ab-config = { workspace = true }
+ab-log = { workspace = true }
+ab-provider = { workspace = true }
+ab-refresh = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

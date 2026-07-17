@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=AgentBar
+GenericName=AI provider usage tray
+Comment=Menu-bar / tray usage for Codex, Claude, Cursor and more
+Exec=agentbar-gtk
+Icon=agentbar
+Terminal=false
+StartupWMClass=app.agentbar.AgentBar
+Categories=Utility;Development;
+Keywords=ai;codex;claude;cursor;usage;limits;
+StartupNotify=false

@@ -15,6 +15,14 @@ Tiny macOS 14+ menu bar app that keeps **AI coding-provider limits visible** and
 
 <img src="docs/codexbar.png" alt="CodexBar menu popover with provider tiles, usage bars, and reset countdowns" width="520" />
 
+## AgentBar (multiplatform)
+
+This fork is evolving into **AgentBar**: a multiplatform rewrite with a shared **Rust core** (`rust/`, crates `ab-*`, C ABI `agentbar.h` / `ab_*`) and native hosts under `apps/` (WinUI, macOS SwiftUI, Linux GTK). Design: [`docs/design/multiplatform-rust-core.md`](docs/design/multiplatform-rust-core.md). Config primary path: `~/.config/agentbar` with CodexBar read-compat.
+
+```bash
+cd rust && cargo build -p ab-core
+```
+
 ## Why
 
 - **Plan around resets.** Per-provider session, weekly, and monthly windows with countdowns to the next reset — stop guessing whether to start that long task.

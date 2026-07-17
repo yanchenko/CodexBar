@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "seq": 42,
+  "updatedAt": "2026-07-17T12:00:00Z",
+  "refreshing": false,
+  "providers": [
+    {
+      "id": "codex",
+      "enabled": true,
+      "sourceLabel": "oauth",
+      "updatedAt": "2026-07-17T12:00:00Z",
+      "primary": {
+        "usedPercent": 42.5,
+        "windowMinutes": 300,
+        "resetsAt": "2026-07-17T17:00:00Z",
+        "resetDescription": "resets in 5h"
+      },
+      "secondary": {
+        "usedPercent": 10.0,
+        "windowMinutes": 10080
+      },
+      "creditsRemaining": 12.5,
+      "accountLabel": "user@example.com",
+      "dataConfidence": "exact"
+    }
+  ]
+}

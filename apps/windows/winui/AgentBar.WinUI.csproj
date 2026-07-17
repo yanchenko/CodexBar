@@ -1,0 +1,69 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    AgentBar — Windows WinUI 3 tray host. P/Invokes ab_core.dll (same C ABI as
+    agentbar.h). Unpackaged + WindowsAppSDKSelfContained: WAR natives ship beside
+    the exe (no installed Windows App Runtime required for this layout). Tray via H.NotifyIcon.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>AgentBar</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64;ARM64</Platforms>
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <!-- Default RID x64; ARM64 builds should pass -r win-arm64 (or -p:Platform=ARM64). -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and '$(Platform)' == 'ARM64'">win-arm64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <!-- Map RID or Platform so CargoFfiOutDir matches the cargo target used for ab_core. -->
+    <CargoArchSub Condition="'$(RuntimeIdentifier)' == 'win-arm64' or '$(Platform)' == 'ARM64'">aarch64-pc-windows-msvc\</CargoArchSub>
+    <!-- ab_core.dll is built under release-ffi (panic=unwind for catch_unwind). -->
+    <CargoFfiOutDir>$(MSBuildThisFileDirectory)..\..\..\rust\target\$(CargoArchSub)release-ffi\</CargoFfiOutDir>
+    <UseWinUI>true</UseWinUI>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WindowsPackageType>None</WindowsPackageType>
+    <!-- Self-contained unpackaged: WAR natives (Microsoft.ui.xaml.dll etc.) ship next to the
+         exe so PATH / machine dynamic-dependency graphs cannot shadow them. -->
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <AssemblyName>agentbar-winui</AssemblyName>
+    <AssemblyTitle>AgentBar</AssemblyTitle>
+    <Product>AgentBar</Product>
+    <Company>AgentBar</Company>
+  </PropertyGroup>
+
+  <!-- Fail fast when release-ffi ab_core.dll is missing (runtime MessageBox remains last resort). -->
+  <Target Name="WarnMissingAbCoreDll" BeforeTargets="Build;Publish">
+    <Warning Condition="!Exists('$(CargoFfiOutDir)ab_core.dll')"
+             Text="ab_core.dll not found at '$(CargoFfiOutDir)ab_core.dll'. Build the Rust engine first: cd rust &amp;&amp; cargo build --profile release-ffi -p ab-core$(CargoArchSub.Replace('\','').Replace('aarch64-pc-windows-msvc',' --target aarch64-pc-windows-msvc')). The host will still build; runtime load fails with a MessageBox if the DLL is absent." />
+  </Target>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AgentBar.WinUI.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
+    <!-- Prerelease: bottom-taskbar flyout fix absent from stable 2.4.1. -->
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.2-dev.22" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2270" />
+    <PackageReference Include="System.Drawing.Common" Version="10.0.9" />
+    <!-- FileSecurity / DirectorySecurity SetAccessControl for user-only patch ACLs. -->
+    <PackageReference Include="System.IO.FileSystem.AccessControl" Version="5.0.0" />
+  </ItemGroup>
+
+  <!-- Ship ab_core.dll next to the app (built via cargo release-ffi). -->
+  <ItemGroup>
+    <None Include="$(CargoFfiOutDir)ab_core.dll"
+          Condition="Exists('$(CargoFfiOutDir)ab_core.dll')">
+      <Link>ab_core.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
