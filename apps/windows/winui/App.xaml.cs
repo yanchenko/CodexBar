@@ -240,6 +240,13 @@ public partial class App : Application
             var stop = System.Threading.Tasks.Task.Run(Native.EngineStop);
             stop.Wait(TimeSpan.FromSeconds(5));
         }
+        // Join push thread so a hung native wait does not race process teardown.
+        if (_pushThread is { IsAlive: true })
+            _ = _pushThread.Join(TimeSpan.FromSeconds(2));
+        _activate?.Dispose();
+        _activate = null;
+        _instanceMutex?.Dispose();
+        _instanceMutex = null;
         _settings?.Close();
         Exit();
     }

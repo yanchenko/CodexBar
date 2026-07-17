@@ -13,8 +13,8 @@ Design: [`docs/design/multiplatform-rust-core.md`](../../docs/design/multiplatfo
 
 - Windows 10 1809+ / Windows 11
 - [.NET 10 SDK](https://dotnet.microsoft.com/download)
-- [Windows App SDK](https://learn.microsoft.com/windows/apps/windows-app-sdk/) runtime (unpackaged host bootstrapper loads the installed WAR)
-- Rust toolchain (`rustc` 1.97+) with MSVC target (`x86_64-pc-windows-msvc`)
+- Rust toolchain (`rustc` 1.97+) with MSVC target (`x86_64-pc-windows-msvc`; ARM64: `aarch64-pc-windows-msvc`)
+- **No installed Windows App Runtime required** for the default self-contained layout — WAR natives ship beside the exe (`WindowsAppSDKSelfContained=true`)
 
 ## Build the Rust engine (required)
 
@@ -31,18 +31,28 @@ Output:
 rust/target/release-ffi/ab_core.dll
 ```
 
-(ARM64: `cargo build --profile release-ffi -p ab-core --target aarch64-pc-windows-msvc` →
-`rust/target/aarch64-pc-windows-msvc/release-ffi/ab_core.dll`.)
+ARM64:
+
+```powershell
+cargo build --profile release-ffi -p ab-core --target aarch64-pc-windows-msvc
+# → rust/target/aarch64-pc-windows-msvc/release-ffi/ab_core.dll
+```
 
 The WinUI csproj copies that DLL next to the app when present
-(`CargoFfiOutDir` → `CopyToOutputDirectory`).
+(`CargoFfiOutDir` → `CopyToOutputDirectory`). If the DLL is missing, MSBuild emits a **Warning** with the cargo hint (runtime MessageBox is the last line of defense).
 
 ## Build / run AgentBar.WinUI
 
 ```powershell
-# from repo root
+# from repo root — x64 (default RID win-x64)
 cd apps/windows/winui
 dotnet build -c Release -p:Platform=x64
+```
+
+ARM64 (must pass RID so `CargoFfiOutDir` points at the aarch64 release-ffi artifact):
+
+```powershell
+dotnet build -c Release -p:Platform=ARM64 -r win-arm64
 ```
 
 Run (after a successful build):
@@ -68,7 +78,7 @@ Single-instance: a second launch activates the running instance (named mutex `Ag
 - **Refresh** — `ab_refresh_now`.
 - **Exit** — `ab_engine_stop` + quit.
 
-Until real providers land, enabled providers appear with a structured `not_implemented` error from the engine fake snapshot.
+Enabled MVP providers (Codex / Claude / Cursor) are probed by the engine: real usage when credentials exist, otherwise a structured `auth_missing` (or related) error — never a crash.
 
 ## Tests (snapshot contract)
 
@@ -94,4 +104,4 @@ dotnet test -c Release -p:Platform=x64
 
 ## Package notes
 
-Dev builds are **unpackaged** (`WindowsPackageType=None`) with `WindowsAppSDKSelfContained=true` so Windows App Runtime natives (e.g. `Microsoft.ui.xaml.dll`) sit beside the exe. Fully portable zip packaging is a later release PR.
+Dev builds are **unpackaged** (`WindowsPackageType=None`) and **self-contained** (`WindowsAppSDKSelfContained=true`): Windows App Runtime natives (e.g. `Microsoft.ui.xaml.dll`) sit beside the exe. An installed machine WAR is **not** required for this layout. Fully portable zip packaging is a later release PR.

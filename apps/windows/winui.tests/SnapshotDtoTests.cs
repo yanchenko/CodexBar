@@ -34,7 +34,12 @@ public class SnapshotDtoTests
     public void SuccessCodexOmitsErrorParsesRateWindowAndCredits()
     {
         var raw = Load("success_codex.json");
-        Assert.DoesNotContain("\"error\"", raw, StringComparison.Ordinal);
+        using (var doc = JsonDocument.Parse(raw))
+        {
+            var provider = doc.RootElement.GetProperty("providers")[0];
+            Assert.False(provider.TryGetProperty("error", out _), "success fixture must omit error property");
+            Assert.False(provider.TryGetProperty("errorCode", out _), "success fixture must omit errorCode property");
+        }
 
         var snap = Parse(raw);
         Assert.Equal(1, snap.SchemaVersion);
@@ -61,6 +66,29 @@ public class SnapshotDtoTests
         Assert.Equal("user@example.com", p.AccountLabel);
         Assert.Equal("exact", p.DataConfidence);
         Assert.Null(p.CursorRequests);
+    }
+
+    [Fact]
+    public void AllFixturesBanSecretKeys()
+    {
+        // Design security checklist: snapshot fixtures must never carry secret fields.
+        string[] banned = ["apiKey", "cookieHeader", "accessToken", "refreshToken", "\"token\""];
+        foreach (var name in new[]
+                 {
+                     "success_codex.json",
+                     "failure_cursor_auth.json",
+                     "rate_window_full.json",
+                     "cursor_requests.json",
+                 })
+        {
+            var raw = Load(name);
+            foreach (var key in banned)
+            {
+                Assert.False(
+                    raw.Contains(key, StringComparison.Ordinal),
+                    $"fixture {name} must not contain banned key/substring '{key}'");
+            }
+        }
     }
 
     [Fact]

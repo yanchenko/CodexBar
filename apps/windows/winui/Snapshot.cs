@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -103,20 +104,21 @@ internal sealed class ProviderSnap
     /// <summary>Compact text row for the tray flyout (no ProgressBar).</summary>
     public string FormatTrayLine()
     {
+        var inv = CultureInfo.InvariantCulture;
         var name = string.IsNullOrEmpty(Id) ? "?" : char.ToUpperInvariant(Id[0]) + Id[1..];
         if (!string.IsNullOrEmpty(Error))
             return $"{name}: {Error}";
         if (Primary is { } w)
         {
-            var pct = $"{w.UsedPercent:0.#}%";
+            var pct = string.Format(inv, "{0:0.#}%", w.UsedPercent);
             if (CreditsRemaining is { } c)
-                return $"{name}: {pct} · ${c:0.##} left";
+                return string.Format(inv, "{0}: {1} · ${2:0.##} left", name, pct, c);
             if (!string.IsNullOrEmpty(w.ResetDescription))
                 return $"{name}: {pct} · {w.ResetDescription}";
             return $"{name}: {pct}";
         }
         if (CursorRequests is { Used: { } used, Included: { } incl })
-            return $"{name}: {used:0.#}/{incl:0.#} req";
+            return string.Format(inv, "{0}: {1:0.#}/{2:0.#} req", name, used, incl);
         return $"{name}: —";
     }
 }

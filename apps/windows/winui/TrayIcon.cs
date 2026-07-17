@@ -92,7 +92,16 @@ internal sealed class TrayIcon : IDisposable
         if (tip.Length > 120) tip = tip[..117] + "…";
         _icon.ToolTipText = tip;
 
-        // Rebuild flyout so row count can change with enabled providers.
+        // Mutate existing rows when membership count is unchanged to avoid flyout flicker
+        // while open; rebuild only when provider row count changes.
+        if (_flyout != null && _providerItems.Count == Math.Max(lines.Count, 1)
+            && lines.Count > 0 && _providerItems.Count == lines.Count)
+        {
+            for (var i = 0; i < lines.Count; i++)
+                _providerItems[i].Text = lines[i];
+            return;
+        }
+
         var next = BuildMenu(lines);
         _icon.ContextFlyout = next;
         _flyout = next;

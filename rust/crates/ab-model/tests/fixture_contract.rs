@@ -108,3 +108,64 @@ fn cursor_requests_fixture() {
     let back = snap.to_json_string().unwrap();
     assert!(!back.contains("\"error\""));
 }
+
+/// Design security checklist: snapshot fixtures must never carry secret fields.
+#[test]
+fn fixtures_ban_secret_keys() {
+    const FIXTURES: &[&str] = &[
+        "success_codex.json",
+        "failure_cursor_auth.json",
+        "rate_window_full.json",
+        "cursor_requests.json",
+    ];
+    // Substrings that must never appear in public snapshot fixtures.
+    const BANNED: &[&str] = &[
+        "apiKey",
+        "cookieHeader",
+        "accessToken",
+        "refreshToken",
+        "\"token\"",
+        "OPENAI_API_KEY",
+    ];
+    for name in FIXTURES {
+        let raw = load(name);
+        for banned in BANNED {
+            assert!(
+                !raw.contains(banned),
+                "fixture {name} must not contain banned key/substring '{banned}'"
+            );
+        }
+        // Walk object keys recursively for a stricter check.
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_no_banned_keys(&v, name);
+    }
+}
+
+fn assert_no_banned_keys(v: &Value, fixture: &str) {
+    const BANNED_KEYS: &[&str] = &[
+        "apiKey",
+        "cookieHeader",
+        "accessToken",
+        "refreshToken",
+        "token",
+        "access_token",
+        "refresh_token",
+    ];
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                assert!(
+                    !BANNED_KEYS.iter().any(|b| k.eq_ignore_ascii_case(b)),
+                    "fixture {fixture} has banned key '{k}'"
+                );
+                assert_no_banned_keys(child, fixture);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                assert_no_banned_keys(child, fixture);
+            }
+        }
+        _ => {}
+    }
+}
