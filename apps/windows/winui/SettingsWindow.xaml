@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="AgentBar.SettingsWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="AgentBar Settings">
+
+    <Window.SystemBackdrop>
+        <MicaBackdrop />
+    </Window.SystemBackdrop>
+
+    <Grid Padding="24" RowDefinitions="Auto,Auto,*">
+        <TextBlock Grid.Row="0" Text="AgentBar" Style="{StaticResource TitleTextBlockStyle}" />
+        <TextBlock Grid.Row="1" Margin="0,8,0,16"
+                   Text="Settings placeholder — provider probes and config UI land in later PRs."
+                   TextWrapping="Wrap"
+                   Opacity="0.75" />
+        <Border Grid.Row="2" Padding="16" CornerRadius="8"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1">
+            <StackPanel Spacing="8">
+                <TextBlock x:Name="VersionText" Text="Version: —" />
+                <TextBlock x:Name="ConfigPathText" Text="Config: —" TextWrapping="Wrap" />
+                <TextBlock x:Name="EngineText" Text="Engine: —" />
+                <TextBlock x:Name="SnapshotText" Text="Snapshot: —" TextWrapping="Wrap"
+                           FontFamily="Cascadia Mono, Consolas" FontSize="12" />
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

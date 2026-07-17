@@ -8,6 +8,11 @@ xcuserdata/
 # Build products
 .build/
 DerivedData
+rust/target/
+
+# Windows .NET build artifacts (winui + winui.tests)
+apps/windows/**/bin/
+apps/windows/**/obj/
 
 # Bundles / artifacts
 # Main app bundle (any variation)
