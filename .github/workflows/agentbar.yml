@@ -1,0 +1,104 @@
+# AgentBar multiplatform Rust core + host gates (PR14).
+# Required: cargo test --workspace on Ubuntu + Windows.
+# Optional: WinUI build, Linux GTK stub check, macOS host sources present.
+
+name: AgentBar
+
+on:
+  push:
+    branches: [main, feat/agentbar-multiplatform]
+    paths:
+      - "rust/**"
+      - "apps/**"
+      - "docs/security-surface.md"
+      - "docs/design/multiplatform-rust-core.md"
+      - ".github/workflows/agentbar.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "apps/**"
+      - "docs/security-surface.md"
+      - "docs/design/multiplatform-rust-core.md"
+      - ".github/workflows/agentbar.yml"
+
+concurrency:
+  group: agentbar-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-ubuntu:
+    name: rust test (ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --workspace
+        working-directory: rust
+        run: cargo test --workspace -- --test-threads=1
+      - name: release-ffi ab-core
+        working-directory: rust
+        run: cargo build --profile release-ffi -p ab-core
+      - name: Linux GTK stub check (no system GTK)
+        working-directory: apps/linux/gtk
+        run: cargo check --no-default-features
+
+  rust-windows:
+    name: rust test (windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test --workspace
+        working-directory: rust
+        run: cargo test --workspace -- --test-threads=1
+      - name: release-ffi ab-core (cdylib for WinUI)
+        working-directory: rust
+        run: cargo build --profile release-ffi -p ab-core
+      - name: Linux GTK stub check on Windows
+        working-directory: apps/linux/gtk
+        run: cargo check --no-default-features
+
+  winui-optional:
+    name: winui build (optional)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    needs: [rust-windows]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build ab_core.dll
+        working-directory: rust
+        run: cargo build --profile release-ffi -p ab-core
+      - name: Copy ab_core.dll beside WinUI project
+        shell: pwsh
+        run: |
+          $src = "rust/target/release-ffi/ab_core.dll"
+          if (-not (Test-Path $src)) { $src = "rust/target/release-ffi/ab_core.dll" }
+          $dll = Get-ChildItem -Path rust/target -Recurse -Filter ab_core.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $dll) { throw "ab_core.dll not found" }
+          Copy-Item $dll.FullName "apps/windows/winui/ab_core.dll" -Force
+          Write-Host "Copied $($dll.FullName)"
+      - name: dotnet build AgentBar.WinUI
+        working-directory: apps/windows/winui
+        run: dotnet build -c Release -p:Platform=x64
+        continue-on-error: true
+
+  macos-host-sources:
+    name: macOS host sources present
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify SwiftPM host tree (no swift required)
+        run: |
+          set -euo pipefail
+          test -f apps/macos/Package.swift
+          test -f apps/macos/Sources/CAgentBar/include/agentbar.h
+          test -f apps/macos/Sources/AgentBar/AgentBarApp.swift
+          test -f apps/macos/build.sh
+          test -f apps/macos/package.sh
+          test -f docs/security-surface.md
+          echo "macOS host sources + security doc OK"
