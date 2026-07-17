@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "seq": 3,
+  "updatedAt": "2026-07-17T12:00:00Z",
+  "refreshing": false,
+  "providers": [
+    {
+      "id": "claude",
+      "enabled": true,
+      "updatedAt": "2026-07-17T12:00:00Z",
+      "primary": {
+        "usedPercent": 88.0,
+        "windowMinutes": 300,
+        "resetsAt": "2026-07-17T14:00:00Z",
+        "resetDescription": "resets in 2h",
+        "nextRegenPercent": 1.5,
+        "isSyntheticPlaceholder": true
+      },
+      "secondary": {
+        "usedPercent": 50.0,
+        "windowMinutes": 10080
+      },
+      "tertiary": {
+        "usedPercent": 5.0,
+        "windowMinutes": 43200
+      },
+      "extraRateWindows": [
+        {
+          "id": "extra_session",
+          "title": "Session",
+          "window": {
+            "usedPercent": 12.0,
+            "windowMinutes": 60
+          }
+        }
+      ]
+    }
+  ]
+}
