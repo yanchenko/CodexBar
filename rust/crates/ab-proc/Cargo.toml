@@ -9,5 +9,9 @@ authors.workspace = true
 publish.workspace = true
 description = "AgentBar argv-only process runner (timeouts, output caps)."
 
+[dependencies]
+
+[dev-dependencies]
+
 [lints]
 workspace = true
