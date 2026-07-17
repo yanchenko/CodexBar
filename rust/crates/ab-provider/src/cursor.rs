@@ -1,5 +1,7 @@
 //! Cursor provider: **manual cookie only** (no Chromium DPAPI import in v1).
 //!
+//! PR8: cookieSource=manual + cookieHeader; mock fixture for usage; auth_missing without cookie.
+//!
 //! Requires `cookieSource=manual` + non-empty `cookieHeader` (or `manualCookieHeader`)
 //! in config. Probes `GET /api/usage-summary` with Cookie header.
 
