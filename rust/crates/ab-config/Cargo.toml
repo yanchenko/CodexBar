@@ -12,6 +12,10 @@ description = "AgentBar config paths, load, and merge-patch save."
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+ab-log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
