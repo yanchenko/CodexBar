@@ -1,0 +1,4 @@
+module CAgentBar {
+    header "agentbar.h"
+    export *
+}
