@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
+using Windows.System.Power;
 
 namespace AgentBar;
 
@@ -22,6 +23,7 @@ public partial class App : Application
     private bool _exiting;
     private bool _hostingEngine;
     private Thread? _pushThread;
+    private Thread? _hostSignalsThread;
     private volatile bool _pushStop;
     private readonly object _statusDispatchLock = new();
     private UsageSnapshot? _pendingStatus;
@@ -101,6 +103,8 @@ public partial class App : Application
 
         // One-shot paint before push thread.
         ApplySnapshot(UsageSnapshot.Probe());
+        PushHostPowerSignals();
+        StartHostSignalsPoll();
 
         if (!hidden)
             ShowSettings();
@@ -139,7 +143,10 @@ public partial class App : Application
                 _settings!.AppWindow.Hide();
             };
         }
-        _settings.ApplySnapshot(UsageSnapshot.Probe());
+        var snap = UsageSnapshot.Probe();
+        _settings.ApplySnapshot(snap);
+        // Re-bind toggles each time Settings is shown (CLI/other hosts may have patched).
+        _settings.HydrateProviderToggles(snap);
         _settings.AppWindow.Show();
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(_settings);
         ShowWindow(hwnd, SW_RESTORE);
@@ -228,6 +235,46 @@ public partial class App : Application
         _pushThread.Start();
     }
 
+    /// <summary>
+    /// Feed WinRT power state into adaptive refresh (<c>ab_set_host_signals_json</c>).
+    /// Low power when Energy Saver is on or discharging with &lt;20% remaining.
+    /// Thermal is not exposed as a simple WinRT app signal — left false.
+    /// </summary>
+    private static void PushHostPowerSignals()
+    {
+        try
+        {
+            bool energySaver = PowerManager.EnergySaverStatus == EnergySaverStatus.On;
+            bool lowBattery = PowerManager.BatteryStatus == BatteryStatus.Discharging
+                              && PowerManager.RemainingChargePercent is >= 0 and < 20;
+            bool lowPower = energySaver || lowBattery;
+            var json = lowPower
+                ? "{\"lowPower\":true,\"thermalSerious\":false}"
+                : "{\"lowPower\":false,\"thermalSerious\":false}";
+            _ = Native.SetHostSignalsJson(json);
+        }
+        catch
+        {
+            // PowerManager may be unavailable in some sandbox/VM contexts — degrade gracefully.
+        }
+    }
+
+    private void StartHostSignalsPoll()
+    {
+        _hostSignalsThread = new Thread(() =>
+        {
+            while (!_pushStop)
+            {
+                PushHostPowerSignals();
+                // Coarse poll; adaptive sleep re-plans on change via plan_epoch.
+                for (var i = 0; i < 60 && !_pushStop; i++)
+                    Thread.Sleep(1000);
+            }
+        })
+        { IsBackground = true, Name = "host-signals" };
+        _hostSignalsThread.Start();
+    }
+
     private void ExitApp()
     {
         if (_exiting) return;
@@ -243,6 +290,8 @@ public partial class App : Application
         // Join push thread so a hung native wait does not race process teardown.
         if (_pushThread is { IsAlive: true })
             _ = _pushThread.Join(TimeSpan.FromSeconds(2));
+        if (_hostSignalsThread is { IsAlive: true })
+            _ = _hostSignalsThread.Join(TimeSpan.FromSeconds(2));
         _activate?.Dispose();
         _activate = null;
         _instanceMutex?.Dispose();

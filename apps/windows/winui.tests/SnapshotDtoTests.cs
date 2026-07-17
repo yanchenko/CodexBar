@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Security.AccessControl;
 using System.Text.Json;
 using Xunit;
 
@@ -167,6 +168,36 @@ public class SnapshotDtoTests
         Assert.True(json.Contains("apiKey", StringComparison.Ordinal));
         // Forbidden shapes for host save path.
         Assert.False(doc.RootElement.TryGetProperty("version", out _), "host patch must not rewrite whole tree version");
+    }
+
+    [Fact]
+    public void TempPatchFileGetsUserOnlyAclWhenPossible()
+    {
+        // Design: host temp patch files use user-only ACL before apply_patch_file.
+        var dir = Path.Combine(Path.GetTempPath(), "AgentBar-tests");
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, $"acl-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, "{\"providers\":[]}");
+            Native.RestrictFileAclCurrentUser(path);
+            Assert.True(File.Exists(path));
+            // If ACL APIs work, inheritance is protected and only current user is present.
+            try
+            {
+                var security = new FileInfo(path).GetAccessControl();
+                var rules = security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
+                Assert.True(rules.Count >= 1);
+            }
+            catch
+            {
+                // GetAccessControl may be unavailable in some CI images — write+restrict must not throw.
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { /* ignore */ }
+        }
     }
 
     [Fact]

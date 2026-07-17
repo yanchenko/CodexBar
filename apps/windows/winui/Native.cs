@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 
@@ -43,6 +45,26 @@ internal static class Native
     public static bool SetAdaptiveRefresh(bool on) => ab_set_adaptive_refresh(on ? (byte)1 : (byte)0) != 0;
     public static void NoteMenuOpened() => ab_note_menu_opened();
 
+    /// <summary>
+    /// Push host power/thermal signals for adaptive refresh
+    /// (<c>{"lowPower":bool,"thermalSerious":bool}</c>). Empty / <c>{}</c> clears.
+    /// </summary>
+    public static bool SetHostSignalsJson(string json)
+    {
+        json ??= "{}";
+        var bytes = Encoding.UTF8.GetBytes(json + "\0");
+        var ptr = Marshal.AllocHGlobal(bytes.Length);
+        try
+        {
+            Marshal.Copy(bytes, 0, ptr, bytes.Length);
+            return ab_set_host_signals_json(ptr) != 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(ptr);
+        }
+    }
+
     public static string SnapshotJson() => TakeString(ab_snapshot_json());
 
     /// <summary>BLOCKS until seq ≠ <paramref name="sinceSeq"/> or timeout. Background thread only.</summary>
@@ -58,25 +80,78 @@ internal static class Native
     public static string ProvidersCatalogJson() => TakeString(ab_providers_catalog_json());
 
     /// <summary>
-    /// Apply a merge-patch JSON document by writing a temp file and calling
-    /// <c>ab_config_apply_patch_file</c>. Never full-file typed rewrite.
+    /// Apply a merge-patch JSON document by writing a temp file with a user-only ACL
+    /// and calling <c>ab_config_apply_patch_file</c>. Never full-file typed rewrite.
     /// </summary>
     public static bool ApplyConfigPatchJson(string patchJson)
     {
         if (string.IsNullOrWhiteSpace(patchJson)) return false;
         var dir = Path.Combine(Path.GetTempPath(), "AgentBar");
         Directory.CreateDirectory(dir);
+        RestrictDirectoryAclBestEffort(dir);
         var path = Path.Combine(dir, $"patch-{Guid.NewGuid():N}.json");
         try
         {
-            // Restrictive ACL best-effort is left to OS temp defaults; file deleted after apply.
             File.WriteAllText(path, patchJson, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            RestrictFileAclCurrentUser(path);
             var full = Path.GetFullPath(path);
             return ApplyPatchFile(full);
         }
         finally
         {
             try { File.Delete(path); } catch { /* best-effort */ }
+        }
+    }
+
+    /// <summary>
+    /// User-only DACL on the temp patch file (design contract). Best-effort: if ACL APIs
+    /// fail we still apply the patch (file is short-lived and deleted after).
+    /// </summary>
+    internal static void RestrictFileAclCurrentUser(string path)
+    {
+        try
+        {
+            var identity = WindowsIdentity.GetCurrent();
+            var sid = identity.User;
+            if (sid is null) return;
+
+            var security = new FileSecurity();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            security.AddAccessRule(new FileSystemAccessRule(
+                sid,
+                FileSystemRights.FullControl,
+                InheritanceFlags.None,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            new FileInfo(path).SetAccessControl(security);
+        }
+        catch
+        {
+            // Best-effort; OS temp is typically user-private already.
+        }
+    }
+
+    internal static void RestrictDirectoryAclBestEffort(string dir)
+    {
+        try
+        {
+            var identity = WindowsIdentity.GetCurrent();
+            var sid = identity.User;
+            if (sid is null) return;
+
+            var security = new DirectorySecurity();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            security.AddAccessRule(new FileSystemAccessRule(
+                sid,
+                FileSystemRights.FullControl,
+                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+            new DirectoryInfo(dir).SetAccessControl(security);
+        }
+        catch
+        {
+            // Best-effort.
         }
     }
 

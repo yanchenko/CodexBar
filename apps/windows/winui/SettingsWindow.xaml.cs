@@ -13,6 +13,9 @@ namespace AgentBar;
 /// </summary>
 public sealed partial class SettingsWindow : Window
 {
+    /// <summary>Suppress toggle → patch while hydrating IsOn from sticky/snapshot truth.</summary>
+    private bool _hydratingToggles;
+
     public SettingsWindow()
     {
         InitializeComponent();
@@ -27,6 +30,34 @@ public sealed partial class SettingsWindow : Window
         VersionText.Text = $"Version: {Native.Version()}";
         ConfigPathText.Text = $"Config: {Native.ConfigPath()}";
         LogDirText.Text = $"Logs: {Native.LogDir()}";
+        // Snapshot only lists enabled providers — membership == enabled for MVP.
+        HydrateProviderToggles(UsageSnapshot.Probe());
+    }
+
+    /// <summary>
+    /// Bind provider toggles to sticky truth. Engine probes only enabled providers, so a
+    /// provider id present in the snapshot is enabled; absent means disabled.
+    /// </summary>
+    internal void HydrateProviderToggles(UsageSnapshot snap)
+    {
+        _hydratingToggles = true;
+        try
+        {
+            var enabled = new System.Collections.Generic.HashSet<string>(
+                System.StringComparer.OrdinalIgnoreCase);
+            foreach (var p in snap.Providers)
+            {
+                if (p.Enabled && !string.IsNullOrEmpty(p.Id))
+                    enabled.Add(p.Id);
+            }
+            CodexEnabled.IsOn = enabled.Contains("codex");
+            ClaudeEnabled.IsOn = enabled.Contains("claude");
+            CursorEnabled.IsOn = enabled.Contains("cursor");
+        }
+        finally
+        {
+            _hydratingToggles = false;
+        }
     }
 
     private void Nav_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
@@ -45,6 +76,8 @@ public sealed partial class SettingsWindow : Window
         DashMeta.Text = $"Updated {snap.UpdatedAt} · seq {snap.Seq}" +
                         (snap.Refreshing ? " · refreshing…" : "");
         RebuildDashboard(snap);
+        // Do not re-hydrate toggles on every push — that fights in-flight user toggles.
+        // Hydration runs on window construct and after successful provider patches.
     }
 
     private void RebuildDashboard(UsageSnapshot snap)
@@ -179,6 +212,7 @@ public sealed partial class SettingsWindow : Window
 
     private void ProviderToggle_Toggled(object sender, RoutedEventArgs e)
     {
+        if (_hydratingToggles) return;
         if (sender is not ToggleSwitch ts || ts.Tag is not string id) return;
         var ok = Native.PatchProvider(id, enabled: ts.IsOn);
         ProvidersStatus.Text = ok
@@ -223,7 +257,7 @@ public sealed partial class SettingsWindow : Window
 
     private void SaveCursor_Click(object sender, RoutedEventArgs e)
     {
-        var cookie = CursorCookie.Text?.Trim();
+        var cookie = CursorCookie.Password?.Trim();
         if (string.IsNullOrEmpty(cookie))
         {
             ProvidersStatus.Text = "Paste a Cursor cookie header first.";
@@ -233,7 +267,7 @@ public sealed partial class SettingsWindow : Window
         ProvidersStatus.Text = ok ? "Cursor cookie saved (merge-patch)." : $"Save failed: {Native.LastErrorJson()}";
         if (ok)
         {
-            CursorCookie.Text = "";
+            CursorCookie.Password = "";
             ApplySnapshot(UsageSnapshot.Probe());
         }
     }

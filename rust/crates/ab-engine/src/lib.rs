@@ -4,7 +4,7 @@
 //! (Codex / Claude / Cursor) and publishes snapshot JSON (no secrets).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,7 +25,7 @@ pub struct LastError {
 }
 
 /// Host adaptive signals (`ab_set_host_signals_json`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSignals {
     #[serde(default)]
@@ -44,6 +44,12 @@ struct EngineState {
     menu_opened_at: Option<SystemTime>,
     /// Incremented when snapshot changes (for wait).
     seq: u64,
+    /// Bumped when schedule inputs change so sleep re-plans (menu / interval / signals).
+    plan_epoch: u64,
+    /// Single-flight refresh gate (coalesce concurrent publish / refresh_now).
+    refresh_in_flight: bool,
+    /// Another refresh requested while in flight — run one follow-up.
+    refresh_coalesced: bool,
     stop_flag: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
@@ -59,6 +65,9 @@ impl EngineState {
             adaptive: false,
             menu_opened_at: None,
             seq: 0,
+            plan_epoch: 0,
+            refresh_in_flight: false,
+            refresh_coalesced: false,
             stop_flag: Arc::new(AtomicBool::new(false)),
             worker: None,
         }
@@ -67,7 +76,7 @@ impl EngineState {
 
 struct EngineInner {
     state: Mutex<EngineState>,
-    /// Notified when seq changes or stop.
+    /// Notified when seq changes, stop, or schedule inputs change (re-plan sleep).
     cv: Condvar,
 }
 
@@ -81,7 +90,6 @@ impl EngineInner {
 }
 
 static ENGINE: Mutex<Option<Arc<EngineInner>>> = Mutex::new(None);
-static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn engine() -> Arc<EngineInner> {
     let mut g = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
@@ -279,18 +287,28 @@ pub fn note_menu_opened() {
     let eng = engine();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
     st.menu_opened_at = Some(SystemTime::now());
+    // Wake worker so adaptive sleep re-evaluates (recentInteraction) promptly.
+    bump_plan_epoch(&eng, &mut st);
 }
 
 pub fn set_host_signals_json(json: &str) -> bool {
     let eng = engine();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
     if json.trim().is_empty() || json.trim() == "{}" {
+        let changed = st.host_signals.low_power || st.host_signals.thermal_serious;
         st.host_signals = HostSignals::default();
+        if changed {
+            bump_plan_epoch(&eng, &mut st);
+        }
         return true;
     }
     match serde_json::from_str::<HostSignals>(json) {
         Ok(s) => {
+            let changed = st.host_signals != s;
             st.host_signals = s;
+            if changed {
+                bump_plan_epoch(&eng, &mut st);
+            }
             true
         }
         Err(e) => {
@@ -328,18 +346,22 @@ pub fn set_refresh_interval_secs(secs: u32) -> bool {
     }
     let eng = engine();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-    st.refresh_interval_secs = secs;
-    // Turning on a fixed interval disables adaptive (hosts set adaptive separately).
-    // Wake worker so it re-reads interval promptly.
-    eng.cv.notify_all();
+    if st.refresh_interval_secs != secs {
+        st.refresh_interval_secs = secs;
+        // Hosts own adaptive flag separately (WinUI clears adaptive when picking fixed).
+        // Wake worker so fixed/adaptive sleep re-plans immediately (not after old deadline).
+        bump_plan_epoch(&eng, &mut st);
+    }
     true
 }
 
 pub fn set_adaptive_refresh(on: bool) -> bool {
     let eng = engine();
     let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-    st.adaptive = on;
-    eng.cv.notify_all();
+    if st.adaptive != on {
+        st.adaptive = on;
+        bump_plan_epoch(&eng, &mut st);
+    }
     true
 }
 
@@ -352,6 +374,7 @@ pub fn refresh_now() -> bool {
     if !running {
         return false;
     }
+    // Coalesced: overlapping calls single-flight via publish_snapshot.
     publish_snapshot(&eng);
     true
 }
@@ -392,9 +415,14 @@ fn set_error_locked(st: &mut EngineState, code: &str, message: &str, provider_id
     });
 }
 
-/// Build snapshot from config + provider probes **without** holding the engine state lock.
-fn build_snapshot() -> UsageSnapshot {
-    let seq = SNAPSHOT_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+/// Bump schedule generation and wake any sleepers so they re-enter policy.
+fn bump_plan_epoch(eng: &EngineInner, st: &mut EngineState) {
+    st.plan_epoch = st.plan_epoch.wrapping_add(1);
+    eng.cv.notify_all();
+}
+
+/// Probe providers **without** holding the engine state lock. Seq is assigned on publish.
+fn build_snapshot_body() -> (String, Vec<ab_model::ProviderSnapshot>) {
     let updated = now_rfc3339();
     let providers = match ab_config::load_raw() {
         Ok(cfg) => ab_provider::probe_enabled_providers(&cfg, &updated),
@@ -403,22 +431,59 @@ fn build_snapshot() -> UsageSnapshot {
             Vec::new()
         }
     };
-    UsageSnapshot {
-        schema_version: ab_model::SCHEMA_VERSION,
-        seq,
-        updated_at: updated,
-        refreshing: false,
-        providers,
-    }
+    (updated, providers)
 }
 
-/// Publish a fresh probed snapshot. Config load + probes run outside the state lock.
+/// Publish a fresh probed snapshot with single-flight coalesce and order-safe seq.
+///
+/// Concurrent `refresh_now` / worker completions set `refresh_coalesced` and do not
+/// run overlapping probes. `refreshing` is true while probes run (seq advances so
+/// hosts can observe the flag). Seq is assigned under the state lock only after
+/// probes finish — never from a pre-increment that could publish out of order.
 fn publish_snapshot(eng: &EngineInner) {
-    let snap = build_snapshot();
-    let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-    st.seq = snap.seq;
-    st.snapshot = snap;
-    eng.cv.notify_all();
+    loop {
+        {
+            let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.refresh_in_flight {
+                // Coalesce: one follow-up after the in-flight probe finishes.
+                st.refresh_coalesced = true;
+                return;
+            }
+            st.refresh_in_flight = true;
+            st.refresh_coalesced = false;
+            // Surface refreshing state to hosts (Settings inspects snap.Refreshing).
+            st.seq = st.seq.saturating_add(1);
+            st.snapshot.refreshing = true;
+            st.snapshot.seq = st.seq;
+            st.snapshot.updated_at = now_rfc3339();
+            eng.cv.notify_all();
+        }
+
+        // Config I/O + network outside the state lock.
+        let (updated, providers) = build_snapshot_body();
+
+        let run_again = {
+            let mut st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.seq = st.seq.saturating_add(1);
+            st.snapshot = UsageSnapshot {
+                schema_version: ab_model::SCHEMA_VERSION,
+                seq: st.seq,
+                updated_at: updated,
+                refreshing: false,
+                providers,
+            };
+            st.refresh_in_flight = false;
+            let again = st.refresh_coalesced;
+            st.refresh_coalesced = false;
+            eng.cv.notify_all();
+            again
+        };
+
+        if !run_again {
+            break;
+        }
+        // Coalesced request: probe once more (still single-flight).
+    }
 }
 
 fn worker_loop(eng: Arc<EngineInner>, stop: Arc<AtomicBool>) {
@@ -444,7 +509,7 @@ fn worker_loop(eng: Arc<EngineInner>, stop: Arc<AtomicBool>) {
             ab_refresh::resolve_sleep_secs(interval_secs, adaptive, &input)
         else {
             // Manual mode: do not advance seq without refresh_now / start.
-            sleep_interruptible(Duration::from_secs(1), &stop, &eng);
+            let _ = sleep_interruptible(Duration::from_secs(1), &stop, &eng);
             continue;
         };
 
@@ -455,11 +520,15 @@ fn worker_loop(eng: Arc<EngineInner>, stop: Arc<AtomicBool>) {
             );
         }
 
-        sleep_interruptible(Duration::from_secs(sleep_secs), &stop, &eng);
+        let completed = sleep_interruptible(Duration::from_secs(sleep_secs), &stop, &eng);
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        // Re-check manual after sleep (interval may have been set to 0 / adaptive off).
+        if !completed {
+            // Menu open / interval / adaptive / host signals changed — re-plan without probing.
+            continue;
+        }
+        // Re-check manual after full sleep (interval may have been set to 0 / adaptive off).
         let still_auto = {
             let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
             st.refresh_interval_secs != 0 || st.adaptive
@@ -470,23 +539,34 @@ fn worker_loop(eng: Arc<EngineInner>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn sleep_interruptible(total: Duration, stop: &AtomicBool, eng: &EngineInner) {
-    // Wake early on stop / interval change via condvar, with 200ms floor slices.
+/// Sleep up to `total`, returning `true` if the full duration elapsed.
+/// Returns `false` early on stop or when `plan_epoch` changes (re-plan).
+fn sleep_interruptible(total: Duration, stop: &AtomicBool, eng: &EngineInner) -> bool {
+    let epoch_at_start = {
+        let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.plan_epoch
+    };
     let deadline = SystemTime::now() + total;
     while !stop.load(Ordering::SeqCst) {
         let now = SystemTime::now();
         if now >= deadline {
-            break;
+            return true;
         }
         let remaining = deadline.duration_since(now).unwrap_or(Duration::ZERO);
         let slice = remaining.min(Duration::from_millis(200));
         let st = eng.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (_guard, _timeout) = eng
+        if st.plan_epoch != epoch_at_start {
+            return false;
+        }
+        let (guard, _timeout) = eng
             .cv
             .wait_timeout(st, slice)
             .unwrap_or_else(|e| e.into_inner());
-        // If stop was signalled, loop condition exits.
+        if guard.plan_epoch != epoch_at_start {
+            return false;
+        }
     }
+    false
 }
 
 /// Record rejection of a non-absolute patch path (FFI contract).
@@ -505,7 +585,6 @@ pub fn note_relative_patch_rejected(path: &str) {
 pub fn reset_for_test() {
     let _ = stop();
     *ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    SNAPSHOT_SEQ.store(0, Ordering::SeqCst);
     ab_config::clear_sticky();
 }
 
@@ -728,5 +807,136 @@ mod tests {
         let (secs, reason) = ab_refresh::resolve_sleep_secs(0, true, &input).unwrap();
         assert_eq!(secs, 30 * 60);
         assert_eq!(reason, Some(ab_refresh::AdaptiveReason::Constrained));
+    }
+
+    #[test]
+    fn schedule_changes_bump_plan_epoch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let epoch0 = {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            st.plan_epoch
+        };
+        note_menu_opened();
+        let epoch1 = {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            st.plan_epoch
+        };
+        assert!(epoch1 > epoch0, "menu open must re-plan sleep");
+        assert!(set_refresh_interval_secs(60));
+        let epoch2 = {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            st.plan_epoch
+        };
+        assert!(epoch2 > epoch1, "interval change must re-plan");
+        // Same interval is a no-op for epoch.
+        assert!(set_refresh_interval_secs(60));
+        {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            assert_eq!(st.plan_epoch, epoch2);
+        }
+        assert!(set_adaptive_refresh(true));
+        let epoch3 = {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            st.plan_epoch
+        };
+        assert!(epoch3 > epoch2);
+        assert!(set_host_signals_json(r#"{"lowPower":true}"#));
+        let epoch4 = {
+            let eng = engine();
+            let st = eng.state.lock().unwrap();
+            st.plan_epoch
+        };
+        assert!(epoch4 > epoch3, "host signals must re-plan");
+    }
+
+    #[test]
+    fn sleep_interruptible_returns_false_on_plan_epoch_change() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let eng = engine();
+        let stop = Arc::new(AtomicBool::new(false));
+        let eng_w = Arc::clone(&eng);
+        let stop_w = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            sleep_interruptible(Duration::from_secs(30), &stop_w, &eng_w)
+        });
+        // Give the sleeper a moment to enter wait, then bump plan.
+        thread::sleep(Duration::from_millis(50));
+        {
+            let mut st = eng.state.lock().unwrap();
+            bump_plan_epoch(&eng, &mut st);
+        }
+        let completed = handle.join().expect("sleeper join");
+        assert!(!completed, "plan epoch change must cancel fixed-deadline sleep");
+    }
+
+    #[test]
+    fn refresh_sets_refreshing_and_advances_seq_monotonically() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.json");
+        std::fs::write(&cfg, r#"{"version":1,"providers":[]}"#).unwrap();
+        ab_config::set_sticky_path(cfg);
+
+        assert!(start());
+        let seq_after_start = {
+            let v: Value = serde_json::from_str(&snapshot_json()).unwrap();
+            assert_eq!(v["refreshing"], false);
+            v["seq"].as_u64().unwrap()
+        };
+        assert!(refresh_now());
+        let v: Value = serde_json::from_str(&snapshot_json()).unwrap();
+        assert_eq!(v["refreshing"], false, "refreshing must clear after probe");
+        let seq2 = v["seq"].as_u64().unwrap();
+        // start publishes (refreshing+done = 2 seq steps), refresh_now another 2.
+        assert!(seq2 > seq_after_start);
+        // Coalesce: overlapping refresh_now while idle still completes.
+        assert!(refresh_now());
+        assert!(refresh_now());
+        let v3: Value = serde_json::from_str(&snapshot_json()).unwrap();
+        assert_eq!(v3["refreshing"], false);
+        assert!(v3["seq"].as_u64().unwrap() > seq2);
+        stop();
+    }
+
+    #[test]
+    fn concurrent_refresh_now_coalesces_single_flight() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_for_test();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config.json");
+        std::fs::write(&cfg, r#"{"version":1,"providers":[]}"#).unwrap();
+        ab_config::set_sticky_path(cfg);
+
+        assert!(start());
+        let before = {
+            let v: Value = serde_json::from_str(&snapshot_json()).unwrap();
+            v["seq"].as_u64().unwrap()
+        };
+        // Hammer refresh_now from several threads; single-flight + coalesce must not
+        // leave refreshing stuck true or regress seq.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(thread::spawn(|| {
+                assert!(refresh_now());
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let after = {
+            let v: Value = serde_json::from_str(&snapshot_json()).unwrap();
+            assert_eq!(v["refreshing"], false);
+            v["seq"].as_u64().unwrap()
+        };
+        assert!(after > before);
+        stop();
     }
 }

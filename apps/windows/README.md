@@ -114,4 +114,4 @@ dotnet test -c Release -p:Platform=x64
 
 ## Package notes
 
-Dev builds are **unpackaged** (`WindowsPackageType=None`) and **self-contained** (`WindowsAppSDKSelfContained=true`): Windows App Runtime natives (e.g. `Microsoft.ui.xaml.dll`) sit beside the exe. An installed machine WAR is **not** required for this layout. Fully portable zip packaging is a later release PR.
+Dev builds are **unpackaged** (`WindowsPackageType=None`) and **self-contained** (`WindowsAppSDKSelfContained=true`): Windows App Runtime natives (e.g. `Microsoft.ui.xaml.dll`) sit beside the exe. An installed machine WAR is **not** required for this layout. Portable zip packaging is supported via `apps/windows/installer/build-portable.ps1` (self-contained stage + `agentbar-*-windows-*.zip`).

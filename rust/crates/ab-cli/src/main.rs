@@ -54,8 +54,18 @@ Usage:
   agentbar config path
   agentbar config patch --file <path>
   agentbar config set-provider <id> [--enabled true|false] [--source-mode <mode>]
-                                    [--api-key <key>] [--cookie-header <hdr>]
+                                    [--api-key-env <VAR>|--api-key -|--api-key <key>]
+                                    [--cookie-header-env <VAR>|--cookie-header -|--cookie-header <hdr>]
   agentbar config migrate
+
+Secrets:
+  Prefer `config patch --file` or env/stdin — never put real keys on argv
+  (process list / shell history). Forms:
+    --api-key-env AGENTBAR_API_KEY     read secret from environment variable
+    --api-key -                        read one line from stdin
+    --cookie-header-env VAR / -        same for cookie header
+  Bare --api-key <value> still works but is unsafe for real credentials.
+  Fallback env (when flag omitted): AGENTBAR_API_KEY, AGENTBAR_COOKIE_HEADER.
 
 Exit codes: 0 ok, 1 runtime/error, 2 usage.
 ",
@@ -257,6 +267,8 @@ fn cmd_config(args: &[String]) -> ExitCode {
             let mut source_mode: Option<String> = None;
             let mut api_key: Option<String> = None;
             let mut cookie_header: Option<String> = None;
+            let mut api_key_from_argv = false;
+            let mut cookie_from_argv = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -283,21 +295,71 @@ fn cmd_config(args: &[String]) -> ExitCode {
                         }
                         source_mode = Some(args[i].clone());
                     }
+                    "--api-key-env" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("--api-key-env requires a variable name");
+                            return ExitCode::from(2);
+                        }
+                        match read_secret_from_env(&args[i]) {
+                            Ok(v) => api_key = Some(v),
+                            Err(e) => {
+                                eprintln!("{e}");
+                                return ExitCode::from(1);
+                            }
+                        }
+                    }
                     "--api-key" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("--api-key requires a value");
+                            eprintln!("--api-key requires a value (or '-' for stdin)");
                             return ExitCode::from(2);
                         }
-                        api_key = Some(args[i].clone());
+                        if args[i] == "-" {
+                            match read_secret_from_stdin("api key") {
+                                Ok(v) => api_key = Some(v),
+                                Err(e) => {
+                                    eprintln!("{e}");
+                                    return ExitCode::from(1);
+                                }
+                            }
+                        } else {
+                            api_key = Some(args[i].clone());
+                            api_key_from_argv = true;
+                        }
+                    }
+                    "--cookie-header-env" => {
+                        i += 1;
+                        if i >= args.len() {
+                            eprintln!("--cookie-header-env requires a variable name");
+                            return ExitCode::from(2);
+                        }
+                        match read_secret_from_env(&args[i]) {
+                            Ok(v) => cookie_header = Some(v),
+                            Err(e) => {
+                                eprintln!("{e}");
+                                return ExitCode::from(1);
+                            }
+                        }
                     }
                     "--cookie-header" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("--cookie-header requires a value");
+                            eprintln!("--cookie-header requires a value (or '-' for stdin)");
                             return ExitCode::from(2);
                         }
-                        cookie_header = Some(args[i].clone());
+                        if args[i] == "-" {
+                            match read_secret_from_stdin("cookie header") {
+                                Ok(v) => cookie_header = Some(v),
+                                Err(e) => {
+                                    eprintln!("{e}");
+                                    return ExitCode::from(1);
+                                }
+                            }
+                        } else {
+                            cookie_header = Some(args[i].clone());
+                            cookie_from_argv = true;
+                        }
                     }
                     other => {
                         eprintln!("unknown set-provider flag: {other}");
@@ -305,6 +367,29 @@ fn cmd_config(args: &[String]) -> ExitCode {
                     }
                 }
                 i += 1;
+            }
+
+            // Prefer env fallbacks when flags omitted (still no secret on argv).
+            if api_key.is_none() {
+                if let Ok(v) = env::var("AGENTBAR_API_KEY") {
+                    if !v.is_empty() {
+                        api_key = Some(v);
+                    }
+                }
+            }
+            if cookie_header.is_none() {
+                if let Ok(v) = env::var("AGENTBAR_COOKIE_HEADER") {
+                    if !v.is_empty() {
+                        cookie_header = Some(v);
+                    }
+                }
+            }
+
+            if api_key_from_argv || cookie_from_argv {
+                eprintln!(
+                    "warning: secret on argv is visible in process lists and shell history; \
+prefer --api-key-env / --cookie-header-env, `--api-key -`, or `config patch --file`"
+                );
             }
 
             let mut entry = json!({ "id": id });
@@ -347,4 +432,30 @@ fn cmd_config(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn read_secret_from_env(var: &str) -> Result<String, String> {
+    match env::var(var) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        Ok(_) => Err(format!("environment variable {var} is empty")),
+        Err(_) => Err(format!("environment variable {var} is not set")),
+    }
+}
+
+fn read_secret_from_stdin(label: &str) -> Result<String, String> {
+    use std::io::{self, BufRead};
+    let mut line = String::new();
+    let stdin = io::stdin();
+    let n = stdin
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("failed to read {label} from stdin: {e}"))?;
+    if n == 0 {
+        return Err(format!("stdin closed before {label} was provided"));
+    }
+    let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+    if trimmed.is_empty() {
+        return Err(format!("{label} from stdin is empty"));
+    }
+    Ok(trimmed)
 }

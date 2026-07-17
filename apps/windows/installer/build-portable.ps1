@@ -92,6 +92,17 @@ else {
     if (-not (Test-Path $stage)) { throw "stage missing: $stage" }
 }
 
+# Required stage contents (SkipPublish and full publish).
+$required = @(
+    (Join-Path $stage 'ab_core.dll'),
+    (Join-Path $stage 'agentbar-winui.exe')
+)
+foreach ($f in $required) {
+    if (-not (Test-Path $f)) {
+        throw "portable stage incomplete: missing $f"
+    }
+}
+
 Write-Host "==> 3/3  zip → Output\$zipName" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force $outDir | Out-Null
 $zip = Join-Path $outDir $zipName

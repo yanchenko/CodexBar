@@ -89,9 +89,8 @@
                         <StackPanel Spacing="10">
                             <TextBlock Text="Cursor" Style="{StaticResource SubtitleTextBlockStyle}" />
                             <ToggleSwitch x:Name="CursorEnabled" Header="Enabled" Toggled="ProviderToggle_Toggled" Tag="cursor" />
-                            <TextBox x:Name="CursorCookie" Header="Cookie header (manual)"
-                                     PlaceholderText="Paste WorkosCursorSessionToken=…"
-                                     TextWrapping="Wrap" AcceptsReturn="True" MinHeight="64" />
+                            <PasswordBox x:Name="CursorCookie" Header="Cookie header (manual)"
+                                         PlaceholderText="Paste WorkosCursorSessionToken=…" />
                             <Button Content="Save Cursor cookie" Click="SaveCursor_Click" />
                         </StackPanel>
                     </Border>
