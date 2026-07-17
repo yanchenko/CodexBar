@@ -6,8 +6,12 @@ version = 4
 name = "ab-cli"
 version = "0.1.0"
 dependencies = [
+ "ab-config",
  "ab-engine",
  "ab-model",
+ "ab-provider",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -41,6 +45,7 @@ dependencies = [
  "ab-log",
  "ab-model",
  "ab-provider",
+ "ab-refresh",
  "serde",
  "serde_json",
  "tempfile",
@@ -88,6 +93,10 @@ dependencies = [
  "serde_json",
  "tempfile",
 ]
+
+[[package]]
+name = "ab-refresh"
+version = "0.1.0"
 
 [[package]]
 name = "aho-corasick"

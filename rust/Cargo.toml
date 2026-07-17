@@ -7,6 +7,7 @@ members = [
     "crates/ab-proc",
     "crates/ab-http",
     "crates/ab-provider",
+    "crates/ab-refresh",
     "crates/ab-engine",
     "crates/ab-core",
     "crates/ab-cli",
@@ -44,6 +45,7 @@ ab-log = { path = "crates/ab-log" }
 ab-proc = { path = "crates/ab-proc" }
 ab-http = { path = "crates/ab-http" }
 ab-provider = { path = "crates/ab-provider" }
+ab-refresh = { path = "crates/ab-refresh" }
 ab-engine = { path = "crates/ab-engine" }
 
 [profile.release]
