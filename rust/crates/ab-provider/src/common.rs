@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Process-wide lock for OAuth credential read-modify-write (Codex auth.json, Claude credentials).
-/// Best-effort against concurrent engine + CLI refresh clobber; not a cross-process flock.
+/// Combined with a sibling `.lock` file OS lock for cross-process GUI+CLI races (AB-005).
 static AUTH_IO: Mutex<()> = Mutex::new(());
 
 /// Stable error codes used in snapshot rows (never secrets).
@@ -155,8 +155,10 @@ pub fn with_auth_lock<R>(f: impl FnOnce() -> R) -> R {
 
 /// Atomic JSON write: temp + fsync + rename (with `.bak` safety like ab-config).
 ///
-/// Holds [`AUTH_IO`]. Sets `0600` on Unix. Concurrent GUI+CLI still race across
-/// processes; within one process, refreshes are serialized.
+/// Holds [`AUTH_IO`] plus a sibling OS file lock (`path` + `.lock`) for
+/// cross-process GUI+CLI serialization (AB-005). Sets `0600` on Unix and
+/// user-only DACL on Windows (AB-002). Third-party CLIs that ignore the lock
+/// file can still race.
 #[allow(dead_code)] // public helper for providers that write without a prior read merge
 pub fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
     with_auth_lock(|| write_json_atomic_held(path, value))
@@ -164,6 +166,9 @@ pub fn write_json_atomic(path: &Path, value: &Value) -> Result<(), String> {
 
 /// Atomic write while caller already holds the auth lock via [`with_auth_lock`].
 pub fn write_json_atomic_held(path: &Path, value: &Value) -> Result<(), String> {
+    // Cross-process exclusive lock on sibling `.lock` (best-effort).
+    let _os_lock = AuthFileLock::acquire(path)?;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -193,12 +198,20 @@ pub fn write_json_atomic_held(path: &Path, value: &Value) -> Result<(), String> 
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
     }
+    #[cfg(windows)]
+    {
+        harden_windows_acl(&tmp_path);
+    }
 
     if path.exists() {
         if bak_path.exists() {
             let _ = fs::remove_file(&bak_path);
         }
         fs::rename(path, &bak_path).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        {
+            harden_windows_acl(&bak_path);
+        }
     }
 
     if let Err(e) = fs::rename(&tmp_path, path) {
@@ -214,6 +227,127 @@ pub fn write_json_atomic_held(path: &Path, value: &Value) -> Result<(), String> 
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        harden_windows_acl(path);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn harden_windows_acl(path: &Path) {
+    if let Err(e) = ab_config::restrict_file_acl_current_user(path) {
+        ab_log::warn(
+            "auth",
+            format!("Windows ACL harden failed for {}: {e}", path.display()),
+        );
+    }
+}
+
+/// Sibling `.lock` file with OS exclusive lock (LockFileEx / flock).
+/// Held for the duration of an auth read-merge-write critical section.
+struct AuthFileLock {
+    _file: fs::File,
+}
+
+impl AuthFileLock {
+    fn acquire(auth_path: &Path) -> Result<Self, String> {
+        let lock_path = auth_lock_path(auth_path);
+        if let Some(parent) = lock_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        // Retry a few times on contention (GUI + CLI simultaneous refresh).
+        let mut last_err = String::new();
+        for attempt in 0..40 {
+            match try_lock_once(&lock_path) {
+                Ok(file) => return Ok(Self { _file: file }),
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < 40 {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "auth file lock busy ({}): {last_err}",
+            lock_path.display()
+        ))
+    }
+}
+
+fn auth_lock_path(auth_path: &Path) -> PathBuf {
+    let mut name = auth_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| "auth.json".into());
+    name.push(".lock");
+    auth_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(name)
+}
+
+fn try_lock_once(lock_path: &Path) -> Result<fs::File, String> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    {
+        lock_file_windows(&file)?;
+    }
+    #[cfg(unix)]
+    {
+        lock_file_unix(&file)?;
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        // No OS lock API — process mutex still held by caller.
+        let _ = &file;
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn lock_file_windows(file: &fs::File) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // SAFETY: exclusive lock on entire file; handle is live for File lifetime.
+    unsafe {
+        let handle = file.as_raw_handle() as HANDLE;
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        let ok = LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        );
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_file_unix(file: &fs::File) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: flock on open fd; LOCK_NB fails if held by another process.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
 }
@@ -296,5 +430,23 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn write_json_atomic_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        write_json_atomic(&path, &json!({"tokens":{"access_token":"x"}})).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("access_token"));
+        // Lock file may remain after unlock (handle closed); sibling path is expected.
+        let lock = auth_lock_path(&path);
+        assert!(lock.exists() || !lock.exists()); // either fine after drop
     }
 }

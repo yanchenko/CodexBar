@@ -26,7 +26,7 @@ Living checklist for the multiplatform Rust core + native hosts. Aligns with
 | Prefer absolute CLI paths when resolvable | Hardening | `resolve_cli_program` for `codex` / `claude` |
 | HTTPS client uses rustls (no native-tls default) | Required | `ab_http` / attohttpc |
 | No user-controlled program string from config | Required | Fixed program names |
-| Provider endpoint overrides / custom hosts | Out of MVP | SSRF surface deferred |
+| Provider endpoint overrides / custom hosts | Out of MVP | OpenRouter ignores config `apiBase`/`baseUrl` (hard-coded host; test-only `EndpointOverrides`) |
 
 ## Host / packaging
 
@@ -36,7 +36,10 @@ Living checklist for the multiplatform Rust core + native hosts. Aligns with
 | macOS LSUIElement host links staticlib | Host | `apps/macos` |
 | Linux ksni tray fails soft without SNI | Host | Window still works |
 | Config file perms `0600` on Unix after write | Required | ab-config + auth atomic writes |
-| Simultaneous GUI+CLI auth refresh | Documented limit | In-process lock; cross-process flock best-effort later |
+| Windows user-only DACL on config + auth write-back | Required | `restrict_file_acl_current_user` on sticky + auth tmp/final |
+| Simultaneous GUI+CLI auth refresh | Best-effort | In-process mutex + sibling `.lock` (flock/LockFileEx); third-party CLIs may still race |
+| CLI secrets only via stdin/env | Required | Bare `--api-key`/`--cookie-header` argv values rejected |
+| Merge-patch null must not wipe secrets | Required | Reject null on `apiKey`/`cookieHeader`/…; omit to preserve |
 
 ## Review gates (provider)
 

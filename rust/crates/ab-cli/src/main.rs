@@ -54,17 +54,16 @@ Usage:
   agentbar config path
   agentbar config patch --file <path>
   agentbar config set-provider <id> [--enabled true|false] [--source-mode <mode>]
-                                    [--api-key-env <VAR>|--api-key -|--api-key <key>]
-                                    [--cookie-header-env <VAR>|--cookie-header -|--cookie-header <hdr>]
+                                    [--api-key-env <VAR>|--api-key -]
+                                    [--cookie-header-env <VAR>|--cookie-header -]
   agentbar config migrate
 
 Secrets:
-  Prefer `config patch --file` or env/stdin — never put real keys on argv
-  (process list / shell history). Forms:
+  Never put real keys on argv (process list / shell history). Forms only:
     --api-key-env AGENTBAR_API_KEY     read secret from environment variable
     --api-key -                        read one line from stdin
     --cookie-header-env VAR / -        same for cookie header
-  Bare --api-key <value> still works but is unsafe for real credentials.
+  Bare --api-key <value> / --cookie-header <value> are rejected (exit 2).
   Fallback env (when flag omitted): AGENTBAR_API_KEY, AGENTBAR_COOKIE_HEADER.
 
 Exit codes: 0 ok, 1 runtime/error, 2 usage.
@@ -267,8 +266,6 @@ fn cmd_config(args: &[String]) -> ExitCode {
             let mut source_mode: Option<String> = None;
             let mut api_key: Option<String> = None;
             let mut cookie_header: Option<String> = None;
-            let mut api_key_from_argv = false;
-            let mut cookie_from_argv = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -312,7 +309,7 @@ fn cmd_config(args: &[String]) -> ExitCode {
                     "--api-key" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("--api-key requires a value (or '-' for stdin)");
+                            eprintln!("--api-key requires '-' (stdin) — secrets on argv are rejected");
                             return ExitCode::from(2);
                         }
                         if args[i] == "-" {
@@ -324,8 +321,12 @@ fn cmd_config(args: &[String]) -> ExitCode {
                                 }
                             }
                         } else {
-                            api_key = Some(args[i].clone());
-                            api_key_from_argv = true;
+                            // AB-001: refuse plain-argv secrets (process list / shell history).
+                            eprintln!(
+                                "error: refusing secret on argv (visible in process lists / shell history).\n\
+Use --api-key - (stdin), --api-key-env VAR, AGENTBAR_API_KEY, or `config patch --file`."
+                            );
+                            return ExitCode::from(2);
                         }
                     }
                     "--cookie-header-env" => {
@@ -345,7 +346,9 @@ fn cmd_config(args: &[String]) -> ExitCode {
                     "--cookie-header" => {
                         i += 1;
                         if i >= args.len() {
-                            eprintln!("--cookie-header requires a value (or '-' for stdin)");
+                            eprintln!(
+                                "--cookie-header requires '-' (stdin) — secrets on argv are rejected"
+                            );
                             return ExitCode::from(2);
                         }
                         if args[i] == "-" {
@@ -357,8 +360,11 @@ fn cmd_config(args: &[String]) -> ExitCode {
                                 }
                             }
                         } else {
-                            cookie_header = Some(args[i].clone());
-                            cookie_from_argv = true;
+                            eprintln!(
+                                "error: refusing secret on argv (visible in process lists / shell history).\n\
+Use --cookie-header - (stdin), --cookie-header-env VAR, AGENTBAR_COOKIE_HEADER, or `config patch --file`."
+                            );
+                            return ExitCode::from(2);
                         }
                     }
                     other => {
@@ -383,13 +389,6 @@ fn cmd_config(args: &[String]) -> ExitCode {
                         cookie_header = Some(v);
                     }
                 }
-            }
-
-            if api_key_from_argv || cookie_from_argv {
-                eprintln!(
-                    "warning: secret on argv is visible in process lists and shell history; \
-prefer --api-key-env / --cookie-header-env, `--api-key -`, or `config patch --file`"
-                );
             }
 
             let mut entry = json!({ "id": id });

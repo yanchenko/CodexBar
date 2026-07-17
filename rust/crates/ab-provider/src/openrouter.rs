@@ -20,16 +20,16 @@ fn api_key(cfg: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn base_url(cfg: &Value, override_base: Option<&str>) -> String {
+/// Resolve OpenRouter API base.
+///
+/// Config `apiBase` / `baseUrl` are **ignored** in MVP (AB-004 SSRF): only the
+/// hard-coded OpenRouter host is used in production. Test-only injection goes
+/// through [`crate::EndpointOverrides::openrouter_base`].
+fn base_url(_cfg: &Value, override_base: Option<&str>) -> String {
     if let Some(b) = override_base {
         return b.trim_end_matches('/').to_string();
     }
-    cfg.get("apiBase")
-        .or_else(|| cfg.get("baseUrl"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_BASE.into())
+    DEFAULT_BASE.into()
 }
 
 /// Map OpenRouter credits (+ optional key) JSON into a snapshot.

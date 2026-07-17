@@ -89,9 +89,11 @@ dependencies = [
  "ab-model",
  "ab-proc",
  "httpmock",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

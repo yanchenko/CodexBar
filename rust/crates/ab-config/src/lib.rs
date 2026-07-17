@@ -217,8 +217,27 @@ pub fn default_config_value() -> Value {
     })
 }
 
+/// Secret-bearing provider field names: null must not delete them (AB-006).
+/// Omit the key to preserve; use an explicit clear API if/when added.
+const SECRET_FIELD_KEYS: &[&str] = &[
+    "apiKey",
+    "cookieHeader",
+    "manualCookieHeader",
+    "adminApiKey",
+    "token",
+    "accessToken",
+    "refreshToken",
+    "access_token",
+    "refresh_token",
+];
+
+fn is_secret_field(key: &str) -> bool {
+    SECRET_FIELD_KEYS.iter().any(|k| *k == key)
+}
+
 /// Validate patch root: must be a JSON object; `providers`/`hooks` must not be null;
 /// if `providers` is present it must be a JSON array (merge-by-id contract).
+/// Rejects null on known secret keys anywhere under provider entries.
 pub fn validate_patch(patch: &Value) -> io::Result<()> {
     let Value::Object(map) = patch else {
         return Err(io::Error::new(
@@ -245,6 +264,23 @@ pub fn validate_patch(patch: &Value) -> io::Result<()> {
             io::ErrorKind::InvalidData,
             "config patch `providers` must be a JSON array (merge-by-id); object/string/number rejected",
         ));
+    }
+    if let Some(arr) = map.get("providers").and_then(|v| v.as_array()) {
+        for (i, item) in arr.iter().enumerate() {
+            if let Some(obj) = item.as_object() {
+                for (k, pv) in obj {
+                    if pv.is_null() && is_secret_field(k) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "config patch providers[{i}].{k} must not be null \
+(would wipe secret; omit key to preserve)"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -351,7 +387,8 @@ pub fn apply_patch_file(patch_path: &Path) -> io::Result<Value> {
 /// Deep merge `patch` into `base` (RFC 7396-ish for objects; `providers[]` merged by `id`).
 ///
 /// Returns `InvalidData` if either root is not an object (callers must not replace
-/// the entire sticky document with arrays/scalars/null).
+/// the entire sticky document with arrays/scalars/null), or if a known secret field
+/// is set to null (omit-to-preserve; null wipe is rejected — AB-006).
 pub fn merge_patch(base: &mut Value, patch: &Value) -> io::Result<()> {
     match (base, patch) {
         (Value::Object(base_map), Value::Object(patch_map)) => {
@@ -369,7 +406,7 @@ pub fn merge_patch(base: &mut Value, patch: &Value) -> io::Result<()> {
                             "config patch `providers` must be a JSON array (merge-by-id)",
                         ));
                     };
-                    merge_providers(base_map, patch_arr);
+                    merge_providers(base_map, patch_arr)?;
                     continue;
                 }
                 if k == "hooks" && pv.is_null() {
@@ -379,7 +416,16 @@ pub fn merge_patch(base: &mut Value, patch: &Value) -> io::Result<()> {
                     ));
                 }
                 if pv.is_null() {
-                    // JSON Merge Patch: null deletes (except preserve-denylist above).
+                    if is_secret_field(k) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "config patch must not set `{k}` to null \
+(would wipe secret; omit key to preserve)"
+                            ),
+                        ));
+                    }
+                    // JSON Merge Patch: null deletes (except secret + preserve denylist).
                     base_map.remove(k);
                     continue;
                 }
@@ -401,16 +447,30 @@ pub fn merge_patch(base: &mut Value, patch: &Value) -> io::Result<()> {
     }
 }
 
-fn merge_providers(base_map: &mut Map<String, Value>, patch_arr: &[Value]) {
+fn merge_providers(base_map: &mut Map<String, Value>, patch_arr: &[Value]) -> io::Result<()> {
     let base_arr = base_map
         .entry("providers".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     let Some(arr) = base_arr.as_array_mut() else {
         *base_arr = Value::Array(patch_arr.to_vec());
-        return;
+        return Ok(());
     };
 
     for patch_item in patch_arr {
+        // Reject null secrets even on new provider objects (no wipe / no silent drop).
+        if let Some(obj) = patch_item.as_object() {
+            for (k, pv) in obj {
+                if pv.is_null() && is_secret_field(k) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "config patch must not set `{k}` to null \
+(would wipe secret; omit key to preserve)"
+                        ),
+                    ));
+                }
+            }
+        }
         let Some(pid) = patch_item.get("id").and_then(|v| v.as_str()) else {
             // No id — append as-is
             arr.push(patch_item.clone());
@@ -422,12 +482,12 @@ fn merge_providers(base_map: &mut Map<String, Value>, patch_arr: &[Value]) {
                 .is_some_and(|id| id == pid)
         }) {
             // Deep-merge object keys; unmentioned siblings preserved.
-            // Provider entries are objects; ignore merge errors for malformed items.
-            let _ = merge_patch(existing, patch_item);
+            merge_patch(existing, patch_item)?;
         } else {
             arr.push(patch_item.clone());
         }
     }
+    Ok(())
 }
 
 /// Atomic write (temp + bak + rename). Crash-safe: never deletes the only copy first.
@@ -477,6 +537,11 @@ fn write_atomic_locked(path: &Path, value: &Value) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
     }
+    // AB-007: harden temp (and later final) before rename so crash windows stay private.
+    #[cfg(windows)]
+    {
+        warn_acl_once(restrict_file_acl_current_user(&tmp_path));
+    }
 
     // Preserve previous content via .bak instead of unlink-then-rename (Windows
     // crash between remove and rename used to destroy the only copy).
@@ -486,6 +551,10 @@ fn write_atomic_locked(path: &Path, value: &Value) -> io::Result<()> {
             let _ = fs::remove_file(&bak_path);
         }
         fs::rename(path, &bak_path)?;
+        #[cfg(windows)]
+        {
+            warn_acl_once(restrict_file_acl_current_user(&bak_path));
+        }
     }
 
     if let Err(e) = fs::rename(&tmp_path, path) {
@@ -507,16 +576,7 @@ fn write_atomic_locked(path: &Path, value: &Value) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        if let Err(e) = restrict_acl_current_user(path)
-            && !WIN_ACL_WARNED.swap(true, Ordering::SeqCst)
-        {
-            ab_log::warn(
-                "config",
-                format!(
-                    "Windows ACL harden failed (best-effort; config may inherit default DACL): {e}"
-                ),
-            );
-        }
+        warn_acl_once(restrict_file_acl_current_user(path));
     }
 
     // Silence unused on non-windows.
@@ -528,9 +588,25 @@ fn write_atomic_locked(path: &Path, value: &Value) -> io::Result<()> {
     Ok(())
 }
 
-/// Best-effort: restrict DACL so only the current user has access (design: user ACL).
 #[cfg(windows)]
-fn restrict_acl_current_user(path: &Path) -> io::Result<()> {
+fn warn_acl_once(result: io::Result<()>) {
+    if let Err(e) = result
+        && !WIN_ACL_WARNED.swap(true, Ordering::SeqCst)
+    {
+        ab_log::warn(
+            "config",
+            format!(
+                "Windows ACL harden failed (best-effort; config may inherit default DACL): {e}"
+            ),
+        );
+    }
+}
+
+/// Best-effort: restrict DACL so only the current user has access (design: user ACL).
+///
+/// Shared by config atomic write and auth write-back (`ab-provider`).
+#[cfg(windows)]
+pub fn restrict_file_acl_current_user(path: &Path) -> io::Result<()> {
     windows_acl::set_user_only_dacl(path)
 }
 
@@ -919,6 +995,52 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
             let v: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
             assert_eq!(v["hooks"]["x"], 1);
+        });
+    }
+
+    /// AB-006: null on secret fields must not wipe stored credentials.
+    #[test]
+    fn secret_field_null_patch_rejected() {
+        with_temp_home(|home| {
+            let cfg = home.join(".config").join("agentbar").join("config.json");
+            fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+            let initial = json!({
+                "version": 1,
+                "providers": [
+                    { "id": "codex", "enabled": true, "apiKey": "codex-secret" },
+                    { "id": "cursor", "enabled": false, "cookieHeader": "sess=1" }
+                ]
+            });
+            write_atomic(&cfg, &initial).unwrap();
+            set_sticky_path(cfg.clone());
+
+            let patch = json!({
+                "providers": [
+                    { "id": "codex", "apiKey": null },
+                    { "id": "cursor", "cookieHeader": null }
+                ]
+            });
+            let err = apply_patch_at(&cfg, &patch).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("apiKey") || msg.contains("null"),
+                "unexpected error: {msg}"
+            );
+
+            let v: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(v["providers"][0]["apiKey"], "codex-secret");
+            assert_eq!(v["providers"][1]["cookieHeader"], "sess=1");
+
+            // Direct merge_patch also rejects.
+            let mut base = initial;
+            let err = merge_patch(
+                &mut base,
+                &json!({"providers": [{"id": "codex", "apiKey": null}]}),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(base["providers"][0]["apiKey"], "codex-secret");
         });
     }
 
