@@ -3,7 +3,7 @@
 //! - Windows: WinUI links `ab_core.dll` (cdylib)
 //! - macOS / Linux: staticlib link
 //!
-//! Scaffold exports `ab_version` only; full lifecycle lands in PR3.
+//! Handle-free process-global engine. **No secrets** over the ABI.
 
 pub mod ffi;
 

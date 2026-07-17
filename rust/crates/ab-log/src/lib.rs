@@ -12,7 +12,8 @@ static INIT: Once = Once::new();
 /// Install a simple stderr logger (idempotent). Safe to call from engine start.
 pub fn init() {
     INIT.call_once(|| {
-        let _ = log::set_logger(&RedactingLogger).map(|()| log::set_max_level(log::LevelFilter::Debug));
+        let _ =
+            log::set_logger(&RedactingLogger).map(|()| log::set_max_level(log::LevelFilter::Debug));
     });
 }
 

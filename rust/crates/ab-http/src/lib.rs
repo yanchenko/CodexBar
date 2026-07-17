@@ -79,11 +79,7 @@ impl HttpClient {
     }
 
     /// GET `url` with optional extra headers.
-    pub fn get(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-    ) -> Result<HttpResponse, HttpError> {
+    pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse, HttpError> {
         self.request("GET", url, headers, None)
     }
 
@@ -150,9 +146,7 @@ impl HttpClient {
             .bytes()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         if bytes.len() > self.max_body {
-            return Err(HttpError::BodyTooLarge {
-                max: self.max_body,
-            });
+            return Err(HttpError::BodyTooLarge { max: self.max_body });
         }
 
         Ok(HttpResponse {
@@ -205,7 +199,11 @@ mod tests {
         let client = HttpClient::new();
         let url = server.url("/rpc");
         let resp = client
-            .post(&url, &[("x-test", "1"), ("content-type", "application/json")], br#"{"ping":true}"#)
+            .post(
+                &url,
+                &[("x-test", "1"), ("content-type", "application/json")],
+                br#"{"ping":true}"#,
+            )
             .expect("post");
         m.assert();
         assert_eq!(resp.status, 201);

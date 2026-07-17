@@ -110,8 +110,12 @@ pub fn run_with_env(
 
     // Readers exit when pipes close (child dead). Bound join wait.
     let join_deadline = Duration::from_secs(2);
-    let (stdout, out_trunc) = rx_out.recv_timeout(join_deadline).unwrap_or((Vec::new(), false));
-    let (stderr, err_trunc) = rx_err.recv_timeout(join_deadline).unwrap_or((Vec::new(), false));
+    let (stdout, out_trunc) = rx_out
+        .recv_timeout(join_deadline)
+        .unwrap_or((Vec::new(), false));
+    let (stderr, err_trunc) = rx_err
+        .recv_timeout(join_deadline)
+        .unwrap_or((Vec::new(), false));
 
     Ok(ProcessOutput {
         status_code,
@@ -218,10 +222,7 @@ mod tests {
     #[test]
     fn respects_output_cap() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "ab_proc_cap_{}.txt",
-            std::process::id()
-        ));
+        let path = dir.join(format!("ab_proc_cap_{}.txt", std::process::id()));
         let payload = "x".repeat(10_000);
         std::fs::write(&path, &payload).unwrap();
 

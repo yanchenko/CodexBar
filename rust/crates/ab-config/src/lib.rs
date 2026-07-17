@@ -53,7 +53,12 @@ pub fn default_agentbar_config_path() -> Option<PathBuf> {
     if let Some(xdg) = xdg_config_home() {
         return Some(xdg.join("agentbar").join("config.json"));
     }
-    Some(home_dir()?.join(".config").join("agentbar").join("config.json"))
+    Some(
+        home_dir()?
+            .join(".config")
+            .join("agentbar")
+            .join("config.json"),
+    )
 }
 
 fn agentbar_candidates() -> Vec<PathBuf> {
@@ -166,13 +171,15 @@ pub fn bind_sticky(resolved: &ResolvedPath) {
     *STICKY.lock().unwrap_or_else(|e| e.into_inner()) = Some(resolved.sticky.clone());
 }
 
+/// Current sticky write target if already bound (does **not** auto-resolve).
+pub fn sticky_path_bound() -> Option<PathBuf> {
+    STICKY.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Current sticky write target, resolving+binding if not yet set.
 pub fn sticky_path() -> Option<PathBuf> {
-    {
-        let g = STICKY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(p) = g.as_ref() {
-            return Some(p.clone());
-        }
+    if let Some(p) = sticky_path_bound() {
+        return Some(p);
     }
     let r = resolve_path()?;
     bind_sticky(&r);
@@ -204,9 +211,8 @@ pub fn default_config_value() -> Value {
 
 /// Load sticky config as raw JSON. Creates defaults if missing.
 pub fn load_raw() -> io::Result<Value> {
-    let path = sticky_path().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "could not resolve config path")
-    })?;
+    let path = sticky_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not resolve config path"))?;
     load_raw_from(&path)
 }
 
@@ -225,9 +231,8 @@ pub fn load_raw_from(path: &Path) -> io::Result<Value> {
 
 /// Apply a merge-patch document onto sticky config and write atomically.
 pub fn apply_patch(patch: &Value) -> io::Result<Value> {
-    let path = sticky_path().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "could not resolve config path")
-    })?;
+    let path = sticky_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not resolve config path"))?;
     apply_patch_at(&path, patch)
 }
 
@@ -235,8 +240,7 @@ pub fn apply_patch(patch: &Value) -> io::Result<Value> {
 pub fn apply_patch_at(path: &Path, patch: &Value) -> io::Result<Value> {
     let mut base = if path.is_file() {
         let text = fs::read_to_string(path)?;
-        serde_json::from_str(&text)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
     } else {
         default_config_value()
     };
@@ -248,8 +252,8 @@ pub fn apply_patch_at(path: &Path, patch: &Value) -> io::Result<Value> {
 /// Load patch JSON from a host-written file path and apply to sticky config.
 pub fn apply_patch_file(patch_path: &Path) -> io::Result<Value> {
     let text = fs::read_to_string(patch_path)?;
-    let patch: Value = serde_json::from_str(&text)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let patch: Value =
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     apply_patch(&patch)
 }
 
@@ -258,11 +262,11 @@ pub fn merge_patch(base: &mut Value, patch: &Value) {
     match (base, patch) {
         (Value::Object(base_map), Value::Object(patch_map)) => {
             for (k, pv) in patch_map {
-                if k == "providers" {
-                    if let Some(patch_arr) = pv.as_array() {
-                        merge_providers(base_map, patch_arr);
-                        continue;
-                    }
+                if k == "providers"
+                    && let Some(patch_arr) = pv.as_array()
+                {
+                    merge_providers(base_map, patch_arr);
+                    continue;
                 }
                 if pv.is_null() {
                     // JSON Merge Patch: null deletes. We still allow it for known keys.
@@ -353,12 +357,10 @@ pub fn write_atomic(path: &Path, value: &Value) -> io::Result<()> {
 
 /// Optional: copy sticky content to default AgentBar path and rebind sticky.
 pub fn migrate_to_agentbar() -> io::Result<PathBuf> {
-    let dest = default_agentbar_config_path().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no home for agentbar path")
-    })?;
-    let src = sticky_path().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no sticky path")
-    })?;
+    let dest = default_agentbar_config_path()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home for agentbar path"))?;
+    let src =
+        sticky_path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no sticky path"))?;
     if src == dest {
         return Ok(dest);
     }

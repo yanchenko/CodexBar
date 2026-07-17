@@ -24,8 +24,11 @@ dependencies = [
 name = "ab-core"
 version = "0.1.0"
 dependencies = [
+ "ab-config",
  "ab-engine",
  "ab-model",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -36,6 +39,9 @@ dependencies = [
  "ab-log",
  "ab-model",
  "ab-provider",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
