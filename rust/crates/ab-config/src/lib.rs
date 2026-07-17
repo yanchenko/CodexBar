@@ -217,7 +217,8 @@ pub fn default_config_value() -> Value {
     })
 }
 
-/// Validate patch root: must be a JSON object; `providers`/`hooks` must not be null.
+/// Validate patch root: must be a JSON object; `providers`/`hooks` must not be null;
+/// if `providers` is present it must be a JSON array (merge-by-id contract).
 pub fn validate_patch(patch: &Value) -> io::Result<()> {
     let Value::Object(map) = patch else {
         return Err(io::Error::new(
@@ -236,6 +237,15 @@ pub fn validate_patch(patch: &Value) -> io::Result<()> {
             ));
         }
     }
+    // Wrong-typed providers would replace the whole tree and wipe nested secrets.
+    if let Some(v) = map.get("providers")
+        && !v.is_array()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config patch `providers` must be a JSON array (merge-by-id); object/string/number rejected",
+        ));
+    }
     Ok(())
 }
 
@@ -246,16 +256,57 @@ pub fn load_raw() -> io::Result<Value> {
     load_raw_from(&path)
 }
 
-/// Load from an explicit path; if missing, write defaults and return them.
+/// Backup path used by [`write_atomic`] (`path` + `.bak`).
+pub fn bak_path_for(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut bak_name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| "config.json".into());
+    bak_name.push(".bak");
+    dir.join(bak_name)
+}
+
+/// Load from an explicit path under [`CONFIG_IO`].
+///
+/// If the sticky path is missing but `path.bak` exists (mid-replace crash or concurrent
+/// rename window), restores bak before treating as create-defaults. Holding the lock for
+/// the full read + optional create path prevents concurrent `load_raw` from overwriting a
+/// good write that just finished with defaults.
 pub fn load_raw_from(path: &Path) -> io::Result<Value> {
+    let _io = CONFIG_IO.lock().unwrap_or_else(|e| e.into_inner());
+    load_raw_from_locked(path)
+}
+
+/// Load while caller already holds [`CONFIG_IO`].
+fn load_raw_from_locked(path: &Path) -> io::Result<Value> {
     if path.is_file() {
         let text = fs::read_to_string(path)?;
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         return Ok(v);
     }
+
+    // Sticky missing: prefer restoring .bak over wiping with defaults (Issue A).
+    let bak = bak_path_for(path);
+    if bak.is_file() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Restore bak → sticky so subsequent writers see the prior secret-bearing config.
+        fs::rename(&bak, path)?;
+        let text = fs::read_to_string(path)?;
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        ab_log::warn(
+            "config",
+            "sticky config missing; restored from .bak (prior write may have crashed mid-replace)",
+        );
+        return Ok(v);
+    }
+
     let defaults = default_config_value();
-    write_atomic(path, &defaults)?;
+    write_atomic_locked(path, &defaults)?;
     Ok(defaults)
 }
 
@@ -273,12 +324,8 @@ pub fn apply_patch(patch: &Value) -> io::Result<Value> {
 pub fn apply_patch_at(path: &Path, patch: &Value) -> io::Result<Value> {
     validate_patch(patch)?;
     let _io = CONFIG_IO.lock().unwrap_or_else(|e| e.into_inner());
-    let mut base = if path.is_file() {
-        let text = fs::read_to_string(path)?;
-        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-    } else {
-        default_config_value()
-    };
+    // Use locked load so missing sticky restores .bak instead of blank defaults.
+    let mut base = load_raw_from_locked(path)?;
     if !base.is_object() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -316,12 +363,13 @@ pub fn merge_patch(base: &mut Value, patch: &Value) -> io::Result<()> {
                             "config patch must not set `providers` to null",
                         ));
                     }
-                    if let Some(patch_arr) = pv.as_array() {
-                        merge_providers(base_map, patch_arr);
-                        continue;
-                    }
-                    // Non-array providers: replace key only (not whole config).
-                    base_map.insert(k.clone(), pv.clone());
+                    let Some(patch_arr) = pv.as_array() else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "config patch `providers` must be a JSON array (merge-by-id)",
+                        ));
+                    };
+                    merge_providers(base_map, patch_arr);
                     continue;
                 }
                 if k == "hooks" && pv.is_null() {
@@ -935,6 +983,114 @@ mod tests {
             assert_eq!(sticky_path().unwrap(), dest);
             // Old file not deleted
             assert!(cb.is_file());
+        });
+    }
+
+    #[test]
+    fn non_array_providers_patch_rejected_file_unchanged() {
+        with_temp_home(|home| {
+            let cfg = home.join(".config").join("agentbar").join("config.json");
+            fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+            let initial = json!({
+                "version": 1,
+                "providers": [
+                    { "id": "codex", "enabled": true, "apiKey": "keep-secret" },
+                    { "id": "cursor", "enabled": false, "cookieHeader": "sess=xyz" }
+                ]
+            });
+            write_atomic(&cfg, &initial).unwrap();
+            set_sticky_path(cfg.clone());
+            let before = fs::read_to_string(&cfg).unwrap();
+
+            for bad in [
+                json!({"providers": {}}),
+                json!({"providers": "x"}),
+                json!({"providers": 1}),
+                json!({"providers": true}),
+            ] {
+                let err = apply_patch_at(&cfg, &bad).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "patch={bad}");
+                let after = fs::read_to_string(&cfg).unwrap();
+                assert_eq!(after, before, "file must be unchanged for patch {bad}");
+                let v: Value = serde_json::from_str(&after).unwrap();
+                assert_eq!(v["providers"][0]["apiKey"], "keep-secret");
+                assert_eq!(v["providers"][1]["cookieHeader"], "sess=xyz");
+            }
+        });
+    }
+
+    #[test]
+    fn load_raw_restores_bak_when_sticky_missing() {
+        with_temp_home(|home| {
+            let cfg = home.join("cfg.json");
+            let secret_cfg = json!({
+                "version": 1,
+                "providers": [
+                    { "id": "codex", "enabled": true, "apiKey": "bak-secret" }
+                ]
+            });
+            write_atomic(&cfg, &secret_cfg).unwrap();
+            // Simulate crash mid-replace: sticky gone, only .bak remains.
+            let bak = bak_path_for(&cfg);
+            fs::rename(&cfg, &bak).unwrap();
+            assert!(!cfg.exists());
+            assert!(bak.is_file());
+
+            let loaded = load_raw_from(&cfg).unwrap();
+            assert_eq!(loaded["providers"][0]["apiKey"], "bak-secret");
+            assert!(cfg.is_file(), "sticky must be restored from bak");
+            let on_disk: Value =
+                serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(on_disk["providers"][0]["apiKey"], "bak-secret");
+            // Must not have written default_config_value() over secrets.
+            assert_ne!(on_disk["providers"][0].get("apiKey"), None);
+        });
+    }
+
+    #[test]
+    fn concurrent_load_during_apply_cannot_overwrite_with_defaults() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        with_temp_home(|home| {
+            let cfg = home.join("race-cfg.json");
+            let initial = json!({
+                "version": 1,
+                "providers": [
+                    { "id": "codex", "enabled": true, "apiKey": "race-secret" }
+                ]
+            });
+            write_atomic(&cfg, &initial).unwrap();
+            set_sticky_path(cfg.clone());
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let cfg_load = cfg.clone();
+            let stop_load = Arc::clone(&stop);
+            let loader = thread::spawn(move || {
+                while !stop_load.load(Ordering::SeqCst) {
+                    let _ = load_raw_from(&cfg_load);
+                    thread::yield_now();
+                }
+            });
+
+            // Many apply patches while loader races; secrets must survive.
+            for i in 0..40 {
+                let patch = json!({
+                    "providers": [{ "id": "codex", "enabled": i % 2 == 0 }]
+                });
+                apply_patch_at(&cfg, &patch).unwrap();
+            }
+            stop.store(true, Ordering::SeqCst);
+            loader.join().unwrap();
+
+            let v: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(
+                v["providers"][0]["apiKey"], "race-secret",
+                "concurrent load must not replace secret-bearing config with defaults"
+            );
+            // Still an array of providers (not wiped to default-only shape without secret).
+            assert!(v["providers"].as_array().unwrap().len() >= 1);
         });
     }
 }
